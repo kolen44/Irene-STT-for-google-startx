@@ -44,8 +44,8 @@ text_queue = queue.Queue()
 
 # Настройки по умолчанию
 default_options = {
-    "kiko_ws_url": "ws://localhost:3000/irene-asr",  # WebSocket URL KIKO
-    "kiko_http_url": "http://localhost:3000",        # HTTP URL KIKO (fallback)
+    "kiko_ws_url": "ws://localhost:3001/irene-asr",  # WebSocket URL KIKO
+    "kiko_http_url": "http://localhost:3001",        # HTTP URL KIKO (fallback)
     "kiko_env_path": "../KIKO/server/.env",          # Путь к .env KIKO для чтения настроек микрофона
     "send_partials": False,                           # Отправлять промежуточные результаты
     "reconnect_delay": 3,                             # Задержка переподключения (сек)
