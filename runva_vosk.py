@@ -6,15 +6,73 @@ import vosk
 import sys
 import logging
 import json
+import subprocess
+import threading
 
 from vacore import VACore
 
 mic_blocked = False
+rtsp_process = None
 
 def block_mic():
     global mic_blocked
     #print("Blocking microphone...")
     mic_blocked = True
+
+
+def rtsp_audio_stream(rtsp_url: str, sample_rate: int, audio_queue: queue.Queue):
+    """
+    Получает аудио из RTSP потока через ffmpeg и кладёт в очередь.
+    """
+    global rtsp_process
+    print(f"[RTSP] Подключение к {rtsp_url.split('@')[-1] if '@' in rtsp_url else rtsp_url}")
+    
+    cmd = [
+        'ffmpeg',
+        '-rtsp_transport', 'tcp',
+        '-i', rtsp_url,
+        '-vn',
+        '-acodec', 'pcm_s16le',
+        '-ar', str(sample_rate),
+        '-ac', '1',
+        '-f', 's16le',
+        '-loglevel', 'error',
+        '-'
+    ]
+    
+    try:
+        rtsp_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=8000 * 2
+        )
+        
+        print(f"[RTSP] Подключено, получаю аудио...")
+        
+        block_size = 8000 * 2
+        
+        while True:
+            if mic_blocked:
+                import time
+                time.sleep(0.1)
+                continue
+                
+            data = rtsp_process.stdout.read(block_size)
+            if not data:
+                if rtsp_process.poll() is not None:
+                    stderr = rtsp_process.stderr.read().decode()
+                    print(f"[RTSP] Процесс завершился: {stderr}")
+                    break
+                continue
+            
+            audio_queue.put(data)
+            
+    except Exception as e:
+        print(f"[RTSP] Ошибка: {e}")
+    finally:
+        if rtsp_process:
+            rtsp_process.kill()
 
 # ------------------- vosk ------------------
 if __name__ == "__main__":
@@ -59,6 +117,9 @@ if __name__ == "__main__":
         help='input device (numeric ID or substring)')
     parser.add_argument(
         '-r', '--samplerate', type=int, help='sampling rate')
+    parser.add_argument(
+        '--rtsp', type=str, metavar='RTSP_URL',
+        help='RTSP URL для получения аудио с IP камеры')
     args = parser.parse_args(remaining)
     #args = {}
 
@@ -72,10 +133,18 @@ if __name__ == "__main__":
             print ("Please download a model for your language from https://alphacephei.com/vosk/models")
             print ("and unpack as 'model' in the current folder.")
             parser.exit(0)
-        if args.samplerate is None:
-            device_info = sd.query_devices(args.device, 'input')
-            # soundfile expects an int, sounddevice provides a float:
-            args.samplerate = int(device_info['default_samplerate'])
+        
+        # Определяем режим: RTSP или локальный микрофон
+        use_rtsp = args.rtsp is not None
+        
+        if use_rtsp:
+            # Для RTSP используем 16000 по умолчанию
+            if args.samplerate is None:
+                args.samplerate = 16000
+        else:
+            if args.samplerate is None:
+                device_info = sd.query_devices(args.device, 'input')
+                args.samplerate = int(device_info['default_samplerate'])
 
         model = vosk.Model(args.model)
 
@@ -84,55 +153,76 @@ if __name__ == "__main__":
         else:
             dump_fn = None
 
+        rec = vosk.KaldiRecognizer(model, args.samplerate)
 
+        # initing core
+        core = VACore()
+        core.init_with_plugins()
 
-        with sd.RawInputStream(samplerate=args.samplerate, blocksize = 8000, device=args.device, dtype='int16',
-                               channels=1, callback=callback):
-            print('#' * 80)
-            print('Press Ctrl+C to stop the recording')
-            print('#' * 80)
+        print('#' * 80)
+        if use_rtsp:
+            print(f'RTSP режим: {args.rtsp.split("@")[-1] if "@" in args.rtsp else args.rtsp}')
+        print(f'Sample rate: {args.samplerate}')
+        print('Press Ctrl+C to stop the recording')
+        print('#' * 80)
 
-            rec = vosk.KaldiRecognizer(model, args.samplerate)
-
-            # initing core
-            core = VACore()
-            #core.init_plugin("core")
-            #core.init_plugins(["core"])
-            core.init_with_plugins()
-
-            #core.play_wav('timer/Sounds/Loud beep.wav')
-
+        # === РЕЖИМ RTSP ===
+        if use_rtsp:
+            rtsp_thread = threading.Thread(
+                target=rtsp_audio_stream,
+                args=(args.rtsp, args.samplerate, q),
+                daemon=True
+            )
+            rtsp_thread.start()
+            
             while True:
-                data = q.get()
-                if rec.AcceptWaveform(data):
+                try:
+                    data = q.get(timeout=5.0)
+                    
+                    if rec.AcceptWaveform(data):
+                        recognized_data = json.loads(rec.Result())
+                        voice_input_str = recognized_data["text"]
+                        
+                        if voice_input_str != "":
+                            core.run_input_str(voice_input_str, block_mic)
+                            mic_blocked = False
+                    
+                    core._update_timers()
+                    
+                    if dump_fn is not None:
+                        dump_fn.write(data)
+                        
+                except queue.Empty:
+                    core._update_timers()
+                    continue
+        
+        # === РЕЖИМ ЛОКАЛЬНОГО МИКРОФОНА ===
+        else:
+            with sd.RawInputStream(samplerate=args.samplerate, blocksize=8000, device=args.device, dtype='int16',
+                                   channels=1, callback=callback):
 
-                    recognized_data = rec.Result()
+                while True:
+                    data = q.get()
+                    if rec.AcceptWaveform(data):
 
-                    #print("1",recognized_data)
+                        recognized_data = rec.Result()
+                        recognized_data = json.loads(recognized_data)
+                        voice_input_str = recognized_data["text"]
 
-                    #print(recognized_data)
-                    recognized_data = json.loads(recognized_data)
-                    #print(recognized_data)
-                    voice_input_str = recognized_data["text"]
+                        if voice_input_str != "":
+                            core.run_input_str(voice_input_str, block_mic)
+                            mic_blocked = False
+                    else:
+                        pass
+                    core._update_timers()
 
-
-                    if voice_input_str != "":
-                        core.run_input_str(voice_input_str,block_mic)
-
-
-                        mic_blocked = False
-                        #print("UNBlocking microphone...")
-                else:
-                    #print("2",rec.PartialResult())
-                    pass
-                core._update_timers()
-
-
-                if dump_fn is not None:
-                    dump_fn.write(data)
+                    if dump_fn is not None:
+                        dump_fn.write(data)
 
     except KeyboardInterrupt:
         print('\nDone')
+        if rtsp_process:
+            rtsp_process.kill()
         parser.exit(0)
     except Exception as e:
         logger.exception(e)
