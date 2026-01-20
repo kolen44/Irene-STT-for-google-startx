@@ -1,0 +1,4 @@
+# Минимальные зависимости для runva_kiko.py (интеграция с KIKO)
+vosk>=0.3.45
+sounddevice
+websockets
