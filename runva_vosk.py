@@ -70,17 +70,17 @@ def rtsp_audio_stream(rtsp_url: str, sample_rate: int, audio_queue: queue.Queue)
         block_size = 8000 * 2
         
         while True:
-            if mic_blocked:
-                import time
-                time.sleep(0.1)
-                continue
-                
+            # ВАЖНО: всегда читаем данные, иначе буфер ffmpeg переполнится!
             data = rtsp_process.stdout.read(block_size)
             if not data:
                 if rtsp_process.poll() is not None:
                     stderr = rtsp_process.stderr.read().decode()
                     print(f"[RTSP] Процесс завершился: {stderr}")
                     break
+                continue
+            
+            # Если микрофон заблокирован - просто выбрасываем данные
+            if mic_blocked:
                 continue
             
             try:
