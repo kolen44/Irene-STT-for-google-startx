@@ -16,8 +16,25 @@ rtsp_process = None
 
 def block_mic():
     global mic_blocked
-    #print("Blocking microphone...")
+    print("[DEBUG] Блокировка микрофона")
     mic_blocked = True
+
+def unblock_mic():
+    global mic_blocked
+    print("[DEBUG] Разблокировка микрофона")
+    mic_blocked = False
+
+def clear_queue(q):
+    """Очищает очередь от накопившихся данных"""
+    cleared = 0
+    while not q.empty():
+        try:
+            q.get_nowait()
+            cleared += 1
+        except:
+            break
+    if cleared > 0:
+        print(f"[DEBUG] Очищено {cleared} буферов из очереди")
 
 
 def rtsp_audio_stream(rtsp_url: str, sample_rate: int, audio_queue: queue.Queue):
@@ -66,7 +83,11 @@ def rtsp_audio_stream(rtsp_url: str, sample_rate: int, audio_queue: queue.Queue)
                     break
                 continue
             
-            audio_queue.put(data)
+            try:
+                audio_queue.put(data, timeout=0.5)
+            except queue.Full:
+                # Очередь переполнена, пропускаем буфер
+                pass
             
     except Exception as e:
         print(f"[RTSP] Ошибка: {e}")
@@ -76,7 +97,8 @@ def rtsp_audio_stream(rtsp_url: str, sample_rate: int, audio_queue: queue.Queue)
 
 # ------------------- vosk ------------------
 if __name__ == "__main__":
-    q = queue.Queue()
+    # Ограничиваем размер очереди чтобы избежать накопления
+    q = queue.Queue(maxsize=50)
 
 
 
@@ -184,8 +206,11 @@ if __name__ == "__main__":
                         voice_input_str = recognized_data["text"]
                         
                         if voice_input_str != "":
+                            print(f"[РАСПОЗНАНО] {voice_input_str}")
                             core.run_input_str(voice_input_str, block_mic)
-                            mic_blocked = False
+                            # Очищаем очередь и разблокируем
+                            clear_queue(q)
+                            unblock_mic()
                     
                     core._update_timers()
                     
@@ -193,7 +218,12 @@ if __name__ == "__main__":
                         dump_fn.write(data)
                         
                 except queue.Empty:
+                    print("[DEBUG] Таймаут очереди - проверка соединения")
                     core._update_timers()
+                    continue
+                except Exception as e:
+                    print(f"[ERROR] Ошибка в главном цикле: {e}")
+                    unblock_mic()
                     continue
         
         # === РЕЖИМ ЛОКАЛЬНОГО МИКРОФОНА ===
@@ -210,8 +240,9 @@ if __name__ == "__main__":
                         voice_input_str = recognized_data["text"]
 
                         if voice_input_str != "":
+                            print(f"[РАСПОЗНАНО] {voice_input_str}")
                             core.run_input_str(voice_input_str, block_mic)
-                            mic_blocked = False
+                            unblock_mic()
                     else:
                         pass
                     core._update_timers()
