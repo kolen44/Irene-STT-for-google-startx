@@ -32,6 +32,7 @@ import websockets
 from typing import Optional
 import time
 from pathlib import Path
+import subprocess
 
 from jaa import load_options
 
@@ -51,6 +52,8 @@ default_options = {
     "model_path": "model",                            # Путь к модели VOSK
     "sample_rate": None,                              # Sample rate (None = авто)
     "device": None,                                   # Аудио устройство (None = из KIKO .env)
+    "rtsp_url": None,                                 # RTSP URL для получения аудио с камеры
+    "audio_source": "auto",                           # "auto", "rtsp", "mic"
 }
 
 # Загружаем опции
@@ -292,6 +295,62 @@ def send_text_sync(text: str, is_partial: bool = False):
             print(f"[Очередь] {text}")
 
 
+def rtsp_audio_stream(rtsp_url: str, sample_rate: int, audio_queue: queue.Queue):
+    """
+    Получает аудио из RTSP потока через ffmpeg и кладёт в очередь.
+    """
+    print(f"[RTSP] Подключение к {rtsp_url}")
+    
+    # ffmpeg команда для извлечения аудио из RTSP
+    cmd = [
+        'ffmpeg',
+        '-rtsp_transport', 'tcp',
+        '-i', rtsp_url,
+        '-vn',  # без видео
+        '-acodec', 'pcm_s16le',  # 16-bit PCM
+        '-ar', str(sample_rate),  # sample rate
+        '-ac', '1',  # моно
+        '-f', 's16le',  # raw PCM
+        '-loglevel', 'error',
+        '-'  # вывод в stdout
+    ]
+    
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=8000 * 2  # 16-bit = 2 bytes per sample
+        )
+        
+        print(f"[RTSP] Подключено, получаю аудио...")
+        
+        # Читаем аудио блоками
+        block_size = 8000 * 2  # 8000 samples * 2 bytes
+        
+        while True:
+            if mic_blocked:
+                time.sleep(0.1)
+                continue
+                
+            data = process.stdout.read(block_size)
+            if not data:
+                # Проверяем, жив ли процесс
+                if process.poll() is not None:
+                    stderr = process.stderr.read().decode()
+                    print(f"[RTSP] Процесс завершился: {stderr}")
+                    break
+                continue
+            
+            audio_queue.put(data)
+            
+    except Exception as e:
+        print(f"[RTSP] Ошибка: {e}")
+    finally:
+        if 'process' in locals():
+            process.kill()
+
+
 # ------------------- VOSK Main ------------------
 if __name__ == "__main__":
     q = queue.Queue()
@@ -336,6 +395,12 @@ if __name__ == "__main__":
     parser.add_argument(
         '-k', '--kiko-url', type=str,
         help='KIKO WebSocket URL')
+    parser.add_argument(
+        '--rtsp', type=str, metavar='RTSP_URL',
+        help='RTSP URL для получения аудио с камеры (вместо локального микрофона)')
+    parser.add_argument(
+        '--source', type=str, choices=['auto', 'rtsp', 'mic'], default='auto',
+        help='Источник аудио: auto (авто), rtsp (камера), mic (локальный микрофон)')
     args = parser.parse_args(remaining)
 
     # Настраиваем логирование
@@ -380,10 +445,26 @@ if __name__ == "__main__":
             print("и распакуйте в папку 'model'")
             sys.exit(1)
 
+        # Определяем источник аудио
+        audio_source = args.source or options.get("audio_source", "auto")
+        rtsp_url = args.rtsp or options.get("rtsp_url") or kiko_env.get("RTSP_URL")
+        
+        # Автоопределение: если есть RTSP_URL в KIKO .env — используем его
+        if audio_source == "auto":
+            if rtsp_url:
+                audio_source = "rtsp"
+                print(f"[AUDIO] Автоопределение: найден RTSP_URL в KIKO .env")
+            else:
+                audio_source = "mic"
+                print(f"[AUDIO] Автоопределение: используем локальный микрофон")
+        
         # Определяем sample rate
         if sample_rate is None:
-            device_info = sd.query_devices(device, 'input')
-            sample_rate = int(device_info['default_samplerate'])
+            if audio_source == "rtsp":
+                sample_rate = 16000  # стандартный для VOSK
+            else:
+                device_info = sd.query_devices(device, 'input')
+                sample_rate = int(device_info['default_samplerate'])
 
         print(f"[VOSK] Загрузка модели: {model_path}")
         model = vosk.Model(model_path)
@@ -394,50 +475,95 @@ if __name__ == "__main__":
         ws_thread.start()
         print(f"[KIKO] WebSocket клиент запущен")
 
-        # Запускаем аудио поток
-        with sd.RawInputStream(
-            samplerate=sample_rate, 
-            blocksize=8000, 
-            device=device, 
-            dtype='int16',
-            channels=1, 
-            callback=callback
-        ):
-            # Получаем информацию о реальном устройстве
-            actual_device_info = sd.query_devices(device, 'input')
-            actual_device_name = actual_device_info['name'] if actual_device_info else 'default'
+        rec = vosk.KaldiRecognizer(model, sample_rate)
+        
+        # === РЕЖИМ RTSP ===
+        if audio_source == "rtsp":
+            if not rtsp_url:
+                print("[ОШИБКА] RTSP URL не указан!")
+                print("Укажите --rtsp URL или добавьте RTSP_URL в KIKO .env")
+                sys.exit(1)
             
             print('#' * 60)
-            print('Irene VOSK для KIKO')
+            print('Irene VOSK для KIKO (RTSP режим)')
             print(f'KIKO URL: {options.get("kiko_ws_url")}')
+            print(f'RTSP: {rtsp_url.split("@")[-1] if "@" in rtsp_url else rtsp_url}')
             print(f'Sample rate: {sample_rate}')
-            print(f'Микрофон: {actual_device_name}')
-            if device is not None:
-                print(f'Device ID: {device}')
             print('Нажмите Ctrl+C для остановки')
             print('#' * 60)
-
-            rec = vosk.KaldiRecognizer(model, sample_rate)
-
+            
+            # Запускаем RTSP поток в отдельном потоке
+            rtsp_thread = threading.Thread(
+                target=rtsp_audio_stream, 
+                args=(rtsp_url, sample_rate, q),
+                daemon=True
+            )
+            rtsp_thread.start()
+            
+            # Обрабатываем аудио
             while True:
-                data = q.get()
+                try:
+                    data = q.get(timeout=5.0)
+                    
+                    if rec.AcceptWaveform(data):
+                        result = json.loads(rec.Result())
+                        text = result.get("text", "")
+                        
+                        if text:
+                            print(f"[VOSK] Распознано: {text}")
+                            send_text_sync(text, is_partial=False)
+                    else:
+                        partial = json.loads(rec.PartialResult())
+                        partial_text = partial.get("partial", "")
+                        
+                        if partial_text and options.get("send_partials", False):
+                            send_text_sync(partial_text, is_partial=True)
+                            
+                except queue.Empty:
+                    continue
+        
+        # === РЕЖИМ ЛОКАЛЬНОГО МИКРОФОНА ===
+        else:
+            # Запускаем аудио поток
+            with sd.RawInputStream(
+                samplerate=sample_rate, 
+                blocksize=8000, 
+                device=device, 
+                dtype='int16',
+                channels=1, 
+                callback=callback
+            ):
+                # Получаем информацию о реальном устройстве
+                actual_device_info = sd.query_devices(device, 'input')
+                actual_device_name = actual_device_info['name'] if actual_device_info else 'default'
                 
-                if rec.AcceptWaveform(data):
-                    # Финальный результат
-                    result = json.loads(rec.Result())
-                    text = result.get("text", "")
+                print('#' * 60)
+                print('Irene VOSK для KIKO (микрофон)')
+                print(f'KIKO URL: {options.get("kiko_ws_url")}')
+                print(f'Sample rate: {sample_rate}')
+                print(f'Микрофон: {actual_device_name}')
+                if device is not None:
+                    print(f'Device ID: {device}')
+                print('Нажмите Ctrl+C для остановки')
+                print('#' * 60)
+
+                while True:
+                    data = q.get()
                     
-                    if text:
-                        print(f"[VOSK] Распознано: {text}")
-                        send_text_sync(text, is_partial=False)
-                        mic_blocked = False
-                else:
-                    # Промежуточный результат
-                    partial = json.loads(rec.PartialResult())
-                    partial_text = partial.get("partial", "")
-                    
-                    if partial_text and options.get("send_partials", False):
-                        send_text_sync(partial_text, is_partial=True)
+                    if rec.AcceptWaveform(data):
+                        result = json.loads(rec.Result())
+                        text = result.get("text", "")
+                        
+                        if text:
+                            print(f"[VOSK] Распознано: {text}")
+                            send_text_sync(text, is_partial=False)
+                            mic_blocked = False
+                    else:
+                        partial = json.loads(rec.PartialResult())
+                        partial_text = partial.get("partial", "")
+                        
+                        if partial_text and options.get("send_partials", False):
+                            send_text_sync(partial_text, is_partial=True)
 
     except KeyboardInterrupt:
         print('\n[ВЫХОД] Остановка...')
