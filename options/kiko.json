@@ -1,0 +1,10 @@
+{
+    "kiko_ws_url": "ws://127.0.0.1:3001/irene-asr",
+    "kiko_http_url": "http://127.0.0.1:3001",
+    "kiko_env_path": "../KIKO/server/.env",
+    "send_partials": false,
+    "reconnect_delay": 3,
+    "model_path": "model",
+    "sample_rate": null,
+    "device": null
+}
