@@ -11,9 +11,26 @@ import threading
 import requests
 
 # Настройки KIKO
-KIKO_URL = os.environ.get("KIKO_URL", "http://localhost:3000/ai")
-WAKE_WORD = "оптимус"  # слово активации для KIKO
+KIKO_URL = os.environ.get("KIKO_URL", "http://server:3000/ai")
 SESSION_ID = "vosk-session-1"
+
+# Wake words - разные вариации на русском и английском
+WAKE_WORDS = [
+    # Русский
+    "оптимус",
+    "оптимуса", 
+    "оптимусу",
+    "оптимусом",
+    "оптимусе",
+    # Английский
+    "optimus",
+    "optimous",
+    "optimis",
+    # Транслит/ошибки распознавания
+    "оптимас",
+    "оптимос",
+    "оптимес",
+]
 
 mic_blocked = False
 rtsp_process = None
@@ -80,16 +97,28 @@ def send_to_kiko(text: str):
         print(f"[KIKO] Ошибка: {e}")
 
 
+def check_wake_word(text: str) -> str | None:
+    """
+    Проверяет наличие любого wake word в тексте.
+    Возвращает найденное wake word или None.
+    """
+    text_lower = text.lower()
+    for wake in WAKE_WORDS:
+        if wake in text_lower:
+            return wake
+    return None
+
+
 def process_voice_input(voice_input_str: str):
     """
     Обрабатывает распознанную речь.
-    Если содержит wake word "оптимус" - отправляет в KIKO.
+    Если содержит wake word (оптимус/optimus и вариации) - отправляет в KIKO.
     """
-    text_lower = voice_input_str.lower()
-    
     # Проверяем наличие wake word
-    if WAKE_WORD in text_lower:
-        print(f"[WAKE] Обнаружено wake word '{WAKE_WORD}'")
+    found_wake = check_wake_word(voice_input_str)
+    
+    if found_wake:
+        print(f"[WAKE] Обнаружено wake word '{found_wake}'")
         send_to_kiko(voice_input_str)
         return True
     
@@ -205,18 +234,13 @@ if __name__ == "__main__":
         help='RTSP URL для получения аудио с IP камеры')
     parser.add_argument(
         '--kiko-url', type=str, metavar='KIKO_URL',
-        default=os.environ.get("KIKO_URL", "http://localhost:3000/ai"),
-        help='URL KIKO AI сервера (по умолчанию http://localhost:3000/ai)')
-    parser.add_argument(
-        '--wake-word', type=str, metavar='WAKE_WORD',
-        default="оптимус",
-        help='Wake word для активации KIKO (по умолчанию "оптимус")')
+        default=os.environ.get("KIKO_URL", "http://server:3000/ai"),
+        help='URL KIKO AI сервера (по умолчанию http://server:3000/ai)')
     args = parser.parse_args(remaining)
     
     # Обновляем глобальные настройки из аргументов
-    global KIKO_URL, WAKE_WORD
+    global KIKO_URL
     KIKO_URL = args.kiko_url
-    WAKE_WORD = args.wake_word.lower()
 
     # настраиваем логирование
     logger = logging.getLogger('runva_vosk')  # задаём конкретное имя, иначе здесь будет  __main__
@@ -251,7 +275,8 @@ if __name__ == "__main__":
         rec = vosk.KaldiRecognizer(model, args.samplerate)
 
         print('#' * 80)
-        print(f'KIKO Voice Assistant - Wake word: "{WAKE_WORD}"')
+        print('KIKO Voice Assistant via Irene STT')
+        print(f'Wake words: {", ".join(WAKE_WORDS[:5])}...')
         print(f'KIKO URL: {KIKO_URL}')
         if use_rtsp:
             print(f'RTSP режим: {args.rtsp.split("@")[-1] if "@" in args.rtsp else args.rtsp}')
