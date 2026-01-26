@@ -8,8 +8,12 @@ import logging
 import json
 import subprocess
 import threading
+import requests
 
-from vacore import VACore
+# Настройки KIKO
+KIKO_URL = os.environ.get("KIKO_URL", "http://localhost:3000/ai")
+WAKE_WORD = "оптимус"  # слово активации для KIKO
+SESSION_ID = "vosk-session-1"
 
 mic_blocked = False
 rtsp_process = None
@@ -35,6 +39,63 @@ def clear_queue(q):
             break
     if cleared > 0:
         print(f"[DEBUG] Очищено {cleared} буферов из очереди")
+
+
+def send_to_kiko(text: str):
+    """
+    Отправляет текст в KIKO AI через HTTP POST.
+    Отправляет полный текст - KIKO сам обработает wake word.
+    """
+    print(f"[KIKO] Отправка в KIKO: '{text}'")
+    
+    try:
+        payload = {
+            "sessionId": SESSION_ID,
+            "prompt": text,
+            "source": "asr"
+        }
+        
+        response = requests.post(
+            KIKO_URL,
+            json=payload,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            if "response" in result:
+                print(f"[KIKO] Ответ: {result['response'][:200]}...")
+            elif "error" in result:
+                print(f"[KIKO] Ошибка: {result['error']}")
+            else:
+                print(f"[KIKO] Результат: {result}")
+        else:
+            print(f"[KIKO] HTTP ошибка {response.status_code}: {response.text[:200]}")
+            
+    except requests.exceptions.ConnectionError:
+        print(f"[KIKO] Не удалось подключиться к {KIKO_URL}")
+    except requests.exceptions.Timeout:
+        print("[KIKO] Таймаут запроса")
+    except Exception as e:
+        print(f"[KIKO] Ошибка: {e}")
+
+
+def process_voice_input(voice_input_str: str):
+    """
+    Обрабатывает распознанную речь.
+    Если содержит wake word "оптимус" - отправляет в KIKO.
+    """
+    text_lower = voice_input_str.lower()
+    
+    # Проверяем наличие wake word
+    if WAKE_WORD in text_lower:
+        print(f"[WAKE] Обнаружено wake word '{WAKE_WORD}'")
+        send_to_kiko(voice_input_str)
+        return True
+    
+    # Если нет wake word - игнорируем
+    print(f"[SKIP] Нет wake word в: '{voice_input_str}'")
+    return False
 
 
 def rtsp_audio_stream(rtsp_url: str, sample_rate: int, audio_queue: queue.Queue):
@@ -142,8 +203,20 @@ if __name__ == "__main__":
     parser.add_argument(
         '--rtsp', type=str, metavar='RTSP_URL',
         help='RTSP URL для получения аудио с IP камеры')
+    parser.add_argument(
+        '--kiko-url', type=str, metavar='KIKO_URL',
+        default=os.environ.get("KIKO_URL", "http://localhost:3000/ai"),
+        help='URL KIKO AI сервера (по умолчанию http://localhost:3000/ai)')
+    parser.add_argument(
+        '--wake-word', type=str, metavar='WAKE_WORD',
+        default="оптимус",
+        help='Wake word для активации KIKO (по умолчанию "оптимус")')
     args = parser.parse_args(remaining)
-    #args = {}
+    
+    # Обновляем глобальные настройки из аргументов
+    global KIKO_URL, WAKE_WORD
+    KIKO_URL = args.kiko_url
+    WAKE_WORD = args.wake_word.lower()
 
     # настраиваем логирование
     logger = logging.getLogger('runva_vosk')  # задаём конкретное имя, иначе здесь будет  __main__
@@ -177,11 +250,9 @@ if __name__ == "__main__":
 
         rec = vosk.KaldiRecognizer(model, args.samplerate)
 
-        # initing core
-        core = VACore()
-        core.init_with_plugins()
-
         print('#' * 80)
+        print(f'KIKO Voice Assistant - Wake word: "{WAKE_WORD}"')
+        print(f'KIKO URL: {KIKO_URL}')
         if use_rtsp:
             print(f'RTSP режим: {args.rtsp.split("@")[-1] if "@" in args.rtsp else args.rtsp}')
         print(f'Sample rate: {args.samplerate}')
@@ -207,19 +278,18 @@ if __name__ == "__main__":
                         
                         if voice_input_str != "":
                             print(f"[РАСПОЗНАНО] {voice_input_str}")
-                            core.run_input_str(voice_input_str, block_mic)
+                            # Обработка через KIKO (если есть wake word)
+                            block_mic()
+                            process_voice_input(voice_input_str)
                             # Очищаем очередь и разблокируем
                             clear_queue(q)
                             unblock_mic()
-                    
-                    core._update_timers()
                     
                     if dump_fn is not None:
                         dump_fn.write(data)
                         
                 except queue.Empty:
                     print("[DEBUG] Таймаут очереди - проверка соединения")
-                    core._update_timers()
                     continue
                 except Exception as e:
                     print(f"[ERROR] Ошибка в главном цикле: {e}")
@@ -241,11 +311,12 @@ if __name__ == "__main__":
 
                         if voice_input_str != "":
                             print(f"[РАСПОЗНАНО] {voice_input_str}")
-                            core.run_input_str(voice_input_str, block_mic)
+                            # Обработка через KIKO (если есть wake word)
+                            block_mic()
+                            process_voice_input(voice_input_str)
                             unblock_mic()
                     else:
                         pass
-                    core._update_timers()
 
                     if dump_fn is not None:
                         dump_fn.write(data)
