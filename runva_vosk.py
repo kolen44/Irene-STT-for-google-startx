@@ -11,7 +11,7 @@ import threading
 import requests
 
 # Настройки KIKO
-KIKO_URL = os.environ.get("KIKO_URL", "http://server:3000/ai")
+KIKO_URL = os.environ.get("KIKO_URL", "http://server:4000/ai")
 SESSION_ID = "vosk-session-1"
 
 # Wake words - разные вариации на русском и английском
@@ -58,7 +58,7 @@ def clear_queue(q):
         print(f"[DEBUG] Очищено {cleared} буферов из очереди")
 
 
-def send_to_kiko(text: str):
+def send_to_kiko(text: str, kiko_url: str):
     """
     Отправляет текст в KIKO AI через HTTP POST.
     Отправляет полный текст - KIKO сам обработает wake word.
@@ -73,7 +73,7 @@ def send_to_kiko(text: str):
         }
         
         response = requests.post(
-            KIKO_URL,
+            kiko_url,
             json=payload,
             timeout=30
         )
@@ -109,7 +109,7 @@ def check_wake_word(text: str) -> str | None:
     return None
 
 
-def process_voice_input(voice_input_str: str):
+def process_voice_input(voice_input_str: str, kiko_url: str):
     """
     Обрабатывает распознанную речь.
     Если содержит wake word (оптимус/optimus и вариации) - отправляет в KIKO.
@@ -119,7 +119,7 @@ def process_voice_input(voice_input_str: str):
     
     if found_wake:
         print(f"[WAKE] Обнаружено wake word '{found_wake}'")
-        send_to_kiko(voice_input_str)
+        send_to_kiko(voice_input_str, kiko_url)
         return True
     
     # Если нет wake word - игнорируем
@@ -238,9 +238,8 @@ if __name__ == "__main__":
         help='URL KIKO AI сервера (по умолчанию http://server:3000/ai)')
     args = parser.parse_args(remaining)
     
-    # Обновляем глобальные настройки из аргументов
-    global KIKO_URL
-    KIKO_URL = args.kiko_url
+    # Используем URL из аргументов
+    kiko_url = args.kiko_url
 
     # настраиваем логирование
     logger = logging.getLogger('runva_vosk')  # задаём конкретное имя, иначе здесь будет  __main__
@@ -277,7 +276,7 @@ if __name__ == "__main__":
         print('#' * 80)
         print('KIKO Voice Assistant via Irene STT')
         print(f'Wake words: {", ".join(WAKE_WORDS[:5])}...')
-        print(f'KIKO URL: {KIKO_URL}')
+        print(f'KIKO URL: {kiko_url}')
         if use_rtsp:
             print(f'RTSP режим: {args.rtsp.split("@")[-1] if "@" in args.rtsp else args.rtsp}')
         print(f'Sample rate: {args.samplerate}')
@@ -305,7 +304,7 @@ if __name__ == "__main__":
                             print(f"[РАСПОЗНАНО] {voice_input_str}")
                             # Обработка через KIKO (если есть wake word)
                             block_mic()
-                            process_voice_input(voice_input_str)
+                            process_voice_input(voice_input_str, kiko_url)
                             # Очищаем очередь и разблокируем
                             clear_queue(q)
                             unblock_mic()
@@ -338,7 +337,7 @@ if __name__ == "__main__":
                             print(f"[РАСПОЗНАНО] {voice_input_str}")
                             # Обработка через KIKO (если есть wake word)
                             block_mic()
-                            process_voice_input(voice_input_str)
+                            process_voice_input(voice_input_str, kiko_url)
                             unblock_mic()
                     else:
                         pass
