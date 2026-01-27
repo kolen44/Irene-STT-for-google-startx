@@ -34,44 +34,9 @@ WAKE_WORDS = [
 ]
 
 # Smart Turn - настройки умного склеивания фраз
-SMART_TURN_TIMEOUT = 3.0  # секунд ждать продолжения после wake word
-SMART_TURN_MAX_PHRASES = 50  # максимум фраз для склеивания
-
-# Знаки конца предложения
-END_SENTENCE_MARKERS = ['.', '!', '?', '。', '！', '？']
+SMART_TURN_TIMEOUT = 3.0  # секунд тишины для отправки накопленного
 
 import time
-
-def is_sentence_complete(text: str) -> bool:
-    """Проверяет, заканчивается ли текст знаком конца предложения"""
-    text = text.strip()
-    if not text:
-        return False
-    return any(text.endswith(marker) for marker in END_SENTENCE_MARKERS)
-
-def get_wake_word_position(text: str, wake_word: str) -> str:
-    """
-    Определяет позицию wake word в тексте.
-    Возвращает: 'start', 'middle', 'end', или 'only' (если только wake word)
-    """
-    text_lower = text.lower().strip()
-    words = text_lower.split()
-    
-    if len(words) == 1:
-        return 'only'  # Только wake word
-    
-    # Ищем позицию wake word
-    wake_lower = wake_word.lower()
-    for i, word in enumerate(words):
-        if wake_lower in word:
-            if i == 0:
-                return 'start'
-            elif i == len(words) - 1:
-                return 'end'
-            else:
-                return 'middle'
-    
-    return 'start'  # По умолчанию
 
 # Состояние Smart Turn
 class SmartTurnState:
@@ -86,11 +51,14 @@ class SmartTurnState:
         self.phrases = []
     
     def is_active(self):
-        """Проверяет, активен ли режим ожидания продолжения"""
+        """Проверяет, активен ли режим накопления"""
+        return self.wake_detected
+    
+    def time_since_last_phrase(self):
+        """Возвращает время с последней фразы"""
         if not self.wake_detected:
-            return False
-        elapsed = time.time() - self.wake_time
-        return elapsed < SMART_TURN_TIMEOUT
+            return float('inf')
+        return time.time() - self.wake_time
     
     def extend_timeout(self):
         """Продлевает таймаут - вызывать когда есть активность (partial результаты)"""
@@ -102,104 +70,48 @@ class SmartTurnState:
         self.phrases.append(text)
         if not self.wake_detected:
             self.wake_detected = True
-        self.wake_time = time.time()  # Всегда обновляем время
+        self.wake_time = time.time()
     
     def get_full_text(self):
         """Возвращает склеенный текст"""
         return " ".join(self.phrases)
     
-    def should_send(self, has_wake_word: bool, text: str, wake_word: str = None):
+    def should_send(self, has_wake_word: bool, text: str):
         """
-        Определяет, нужно ли отправлять в KIKO.
-        Возвращает (should_send, full_text)
+        Простая логика:
+        - Если есть wake word и мы не накапливаем → начинаем накапливать
+        - Если есть wake word и уже накапливаем → добавляем и продолжаем
+        - Если нет wake word и накапливаем → добавляем и продолжаем
+        - Отправка ТОЛЬКО по таймауту (в flush_if_timeout)
+        
+        Возвращает (should_send, full_text) - всегда (False, None)
         """
-        # Если это фраза с wake word
-        if has_wake_word and wake_word:
-            position = get_wake_word_position(text, wake_word)
-            
-            # Wake word в середине или конце - отправляем сразу всю фразу
-            if position in ('middle', 'end'):
-                if self.is_active():
-                    # Было что-то накоплено - добавляем и отправляем
-                    self.add_phrase(text)
-                    full_text = self.get_full_text()
-                    self.reset()
-                    return True, full_text
-                else:
-                    # Отправляем только эту фразу
-                    self.reset()
-                    return True, text
-            
-            # Wake word только один (без команды) - ждём продолжения
-            if position == 'only':
-                if self.is_active():
-                    # Уже был wake word - отправляем накопленное
-                    full_text = self.get_full_text()
-                    self.reset()
-                    # Начинаем новый цикл с этим wake word
-                    self.add_phrase(text)
-                    return True, full_text
-                else:
-                    # Ждём команду после wake word
-                    self.reset()
-                    self.add_phrase(text)
-                    return False, None
-            
-            # Wake word в начале
-            if position == 'start':
-                # Проверяем конец предложения
-                if is_sentence_complete(text):
-                    if self.is_active():
-                        self.add_phrase(text)
-                        full_text = self.get_full_text()
-                        self.reset()
-                        return True, full_text
-                    else:
-                        self.reset()
-                        return True, text
-                
-                # Нет конца предложения - ждём продолжения
-                if self.is_active():
-                    self.add_phrase(text)
-                    full_text = self.get_full_text()
-                    self.reset()
-                    return True, full_text
-                else:
-                    self.reset()
-                    self.add_phrase(text)
-                    return False, None
+        if has_wake_word:
+            # Новая фраза с wake word
+            if self.is_active():
+                # Уже накапливаем - просто добавляем
+                self.add_phrase(text)
+            else:
+                # Начинаем накапливать
+                self.reset()
+                self.add_phrase(text)
+            return False, None
         
         # Фраза без wake word
         if self.is_active():
-            # Продолжение после wake word
+            # Продолжение - добавляем
             self.add_phrase(text)
-            
-            # Если конец предложения - отправляем
-            if is_sentence_complete(text):
-                full_text = self.get_full_text()
-                self.reset()
-                return True, full_text
-            
-            # Если набрали максимум фраз - отправляем
-            if len(self.phrases) >= SMART_TURN_MAX_PHRASES:
-                full_text = self.get_full_text()
-                self.reset()
-                return True, full_text
-            
-            # Иначе ждём ещё
-            return False, None
         
-        # Нет wake word и не в режиме ожидания
+        # Никогда не отправляем сразу - только по таймауту
         return False, None
     
     def flush_if_timeout(self):
         """
         Проверяет таймаут и возвращает накопленный текст если пора.
-        Вызывать периодически.
+        Единственное место где происходит отправка.
         """
         if self.wake_detected and len(self.phrases) > 0:
-            elapsed = time.time() - self.wake_time
-            if elapsed >= SMART_TURN_TIMEOUT:
+            if self.time_since_last_phrase() >= SMART_TURN_TIMEOUT:
                 full_text = self.get_full_text()
                 self.reset()
                 return full_text
@@ -300,7 +212,7 @@ def check_wake_word(text: str) -> str | None:
 def process_voice_input(voice_input_str: str, kiko_url: str):
     """
     Обрабатывает распознанную речь с Smart Turn.
-    Склеивает фразы если wake word был сказан с паузой.
+    Накапливает фразы после wake word, отправка только по таймауту.
     """
     global smart_turn
     
@@ -309,19 +221,13 @@ def process_voice_input(voice_input_str: str, kiko_url: str):
     has_wake = found_wake is not None
     
     if has_wake:
-        position = get_wake_word_position(voice_input_str, found_wake)
-        print(f"[WAKE] '{found_wake}' (позиция: {position})")
+        print(f"[WAKE] '{found_wake}' в: '{voice_input_str}'")
     
-    # Smart Turn логика
-    should_send, full_text = smart_turn.should_send(has_wake, voice_input_str, found_wake)
-    
-    if should_send and full_text:
-        print(f"[SEND] → '{full_text}'")
-        send_to_kiko(full_text, kiko_url)
-        return True
+    # Smart Turn логика - только накапливает, не отправляет
+    smart_turn.should_send(has_wake, voice_input_str)
     
     if smart_turn.is_active():
-        print(f"[WAIT] Ожидание... ({len(smart_turn.phrases)} фраз)")
+        print(f"[BUFFER] {len(smart_turn.phrases)} фраз, ждём {SMART_TURN_TIMEOUT}с тишины...")
         return False
     
     if not has_wake:
