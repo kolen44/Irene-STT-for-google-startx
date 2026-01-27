@@ -397,7 +397,7 @@ if __name__ == "__main__":
         print('#' * 80)
         print('KIKO Voice Assistant via Irene STT')
         print(f'Wake words: {", ".join(WAKE_WORDS[:5])}...')
-        print(f'Smart Turn: {SMART_TURN_TIMEOUT}s таймаут, до {SMART_TURN_MAX_PHRASES} фраз')
+        print(f'Smart Turn: {SMART_TURN_TIMEOUT}s тишины для отправки')
         print(f'KIKO URL: {kiko_url}')
         if use_rtsp:
             print(f'RTSP режим: {args.rtsp.split("@")[-1] if "@" in args.rtsp else args.rtsp}')
