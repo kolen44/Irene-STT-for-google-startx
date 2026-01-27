@@ -11,7 +11,7 @@ import threading
 import requests
 
 # Настройки KIKO
-KIKO_URL = os.environ.get("KIKO_URL", "http://server:4000/ai")
+KIKO_URL = os.environ.get("KIKO_URL", "http://server:3000/ai")
 SESSION_ID = "vosk-session-1"
 
 # Wake words - разные вариации на русском и английском
@@ -31,6 +31,94 @@ WAKE_WORDS = [
     "оптимос",
     "оптимес",
 ]
+
+# Smart Turn - настройки умного склеивания фраз
+SMART_TURN_TIMEOUT = 3.0  # секунд ждать продолжения после wake word
+SMART_TURN_MAX_PHRASES = 3  # максимум фраз для склеивания
+
+import time
+
+# Состояние Smart Turn
+class SmartTurnState:
+    def __init__(self):
+        self.wake_detected = False
+        self.wake_time = 0
+        self.phrases = []
+    
+    def reset(self):
+        self.wake_detected = False
+        self.wake_time = 0
+        self.phrases = []
+    
+    def is_active(self):
+        """Проверяет, активен ли режим ожидания продолжения"""
+        if not self.wake_detected:
+            return False
+        elapsed = time.time() - self.wake_time
+        return elapsed < SMART_TURN_TIMEOUT
+    
+    def add_phrase(self, text: str):
+        """Добавляет фразу в буфер"""
+        self.phrases.append(text)
+        if not self.wake_detected:
+            self.wake_detected = True
+            self.wake_time = time.time()
+    
+    def get_full_text(self):
+        """Возвращает склеенный текст"""
+        return " ".join(self.phrases)
+    
+    def should_send(self, has_wake_word: bool, text: str):
+        """
+        Определяет, нужно ли отправлять в KIKO.
+        Возвращает (should_send, full_text)
+        """
+        # Если это новая фраза с wake word
+        if has_wake_word:
+            if self.is_active():
+                # Уже был wake word - отправляем накопленное + новое
+                self.add_phrase(text)
+                full_text = self.get_full_text()
+                self.reset()
+                return True, full_text
+            else:
+                # Новый wake word - начинаем накапливать
+                self.reset()
+                self.add_phrase(text)
+                # Ждём ещё - вдруг будет продолжение
+                return False, None
+        
+        # Фраза без wake word
+        if self.is_active():
+            # Продолжение после wake word
+            self.add_phrase(text)
+            
+            # Если набрали максимум фраз - отправляем
+            if len(self.phrases) >= SMART_TURN_MAX_PHRASES:
+                full_text = self.get_full_text()
+                self.reset()
+                return True, full_text
+            
+            # Иначе ждём ещё
+            return False, None
+        
+        # Нет wake word и не в режиме ожидания
+        return False, None
+    
+    def flush_if_timeout(self):
+        """
+        Проверяет таймаут и возвращает накопленный текст если пора.
+        Вызывать периодически.
+        """
+        if self.wake_detected and len(self.phrases) > 0:
+            elapsed = time.time() - self.wake_time
+            if elapsed >= SMART_TURN_TIMEOUT:
+                full_text = self.get_full_text()
+                self.reset()
+                return full_text
+        return None
+
+smart_turn = SmartTurnState()
 
 mic_blocked = False
 rtsp_process = None
@@ -111,19 +199,45 @@ def check_wake_word(text: str) -> str | None:
 
 def process_voice_input(voice_input_str: str, kiko_url: str):
     """
-    Обрабатывает распознанную речь.
-    Если содержит wake word (оптимус/optimus и вариации) - отправляет в KIKO.
+    Обрабатывает распознанную речь с Smart Turn.
+    Склеивает фразы если wake word был сказан с паузой.
     """
+    global smart_turn
+    
     # Проверяем наличие wake word
     found_wake = check_wake_word(voice_input_str)
+    has_wake = found_wake is not None
     
-    if found_wake:
+    if has_wake:
         print(f"[WAKE] Обнаружено wake word '{found_wake}'")
-        send_to_kiko(voice_input_str, kiko_url)
+    
+    # Smart Turn логика
+    should_send, full_text = smart_turn.should_send(has_wake, voice_input_str)
+    
+    if should_send and full_text:
+        print(f"[SMART] Отправка склеенной фразы: '{full_text}'")
+        send_to_kiko(full_text, kiko_url)
         return True
     
-    # Если нет wake word - игнорируем
-    print(f"[SKIP] Нет wake word в: '{voice_input_str}'")
+    if smart_turn.is_active():
+        print(f"[SMART] Ожидание продолжения... ({len(smart_turn.phrases)} фраз)")
+        return False
+    
+    if not has_wake:
+        print(f"[SKIP] Нет wake word в: '{voice_input_str}'")
+    
+    return False
+
+
+def check_smart_turn_timeout(kiko_url: str):
+    """Проверяет таймаут Smart Turn и отправляет если нужно"""
+    global smart_turn
+    
+    full_text = smart_turn.flush_if_timeout()
+    if full_text:
+        print(f"[SMART] Таймаут - отправка: '{full_text}'")
+        send_to_kiko(full_text, kiko_url)
+        return True
     return False
 
 
@@ -276,6 +390,7 @@ if __name__ == "__main__":
         print('#' * 80)
         print('KIKO Voice Assistant via Irene STT')
         print(f'Wake words: {", ".join(WAKE_WORDS[:5])}...')
+        print(f'Smart Turn: {SMART_TURN_TIMEOUT}s таймаут, до {SMART_TURN_MAX_PHRASES} фраз')
         print(f'KIKO URL: {kiko_url}')
         if use_rtsp:
             print(f'RTSP режим: {args.rtsp.split("@")[-1] if "@" in args.rtsp else args.rtsp}')
@@ -294,7 +409,7 @@ if __name__ == "__main__":
             
             while True:
                 try:
-                    data = q.get(timeout=5.0)
+                    data = q.get(timeout=1.0)  # Короткий таймаут для проверки Smart Turn
                     
                     if rec.AcceptWaveform(data):
                         recognized_data = json.loads(rec.Result())
@@ -309,11 +424,15 @@ if __name__ == "__main__":
                             clear_queue(q)
                             unblock_mic()
                     
+                    # Проверяем таймаут Smart Turn
+                    check_smart_turn_timeout(kiko_url)
+                    
                     if dump_fn is not None:
                         dump_fn.write(data)
                         
                 except queue.Empty:
-                    print("[DEBUG] Таймаут очереди - проверка соединения")
+                    # Проверяем таймаут Smart Turn даже если нет данных
+                    check_smart_turn_timeout(kiko_url)
                     continue
                 except Exception as e:
                     print(f"[ERROR] Ошибка в главном цикле: {e}")
@@ -326,9 +445,14 @@ if __name__ == "__main__":
                                    channels=1, callback=callback):
 
                 while True:
-                    data = q.get()
+                    try:
+                        data = q.get(timeout=1.0)  # Короткий таймаут для Smart Turn
+                    except queue.Empty:
+                        # Проверяем таймаут Smart Turn
+                        check_smart_turn_timeout(kiko_url)
+                        continue
+                    
                     if rec.AcceptWaveform(data):
-
                         recognized_data = rec.Result()
                         recognized_data = json.loads(recognized_data)
                         voice_input_str = recognized_data["text"]
@@ -339,8 +463,9 @@ if __name__ == "__main__":
                             block_mic()
                             process_voice_input(voice_input_str, kiko_url)
                             unblock_mic()
-                    else:
-                        pass
+                    
+                    # Проверяем таймаут Smart Turn
+                    check_smart_turn_timeout(kiko_url)
 
                     if dump_fn is not None:
                         dump_fn.write(data)
