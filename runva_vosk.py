@@ -35,7 +35,7 @@ WAKE_WORDS = [
 
 # Smart Turn - настройки умного склеивания фраз
 SMART_TURN_TIMEOUT = 7.0  # секунд ждать продолжения после wake word
-SMART_TURN_MAX_PHRASES = 10  # максимум фраз для склеивания
+SMART_TURN_MAX_PHRASES = 50  # максимум фраз для склеивания (практически без лимита)
 
 import time
 
