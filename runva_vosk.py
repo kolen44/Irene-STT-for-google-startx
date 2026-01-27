@@ -34,10 +34,44 @@ WAKE_WORDS = [
 ]
 
 # Smart Turn - настройки умного склеивания фраз
-SMART_TURN_TIMEOUT = 5.5  # секунд ждать продолжения после wake word
-SMART_TURN_MAX_PHRASES = 50  # максимум фраз для склеивания (практически без лимита)
+SMART_TURN_TIMEOUT = 3.0  # секунд ждать продолжения после wake word
+SMART_TURN_MAX_PHRASES = 50  # максимум фраз для склеивания
+
+# Знаки конца предложения
+END_SENTENCE_MARKERS = ['.', '!', '?', '。', '！', '？']
 
 import time
+
+def is_sentence_complete(text: str) -> bool:
+    """Проверяет, заканчивается ли текст знаком конца предложения"""
+    text = text.strip()
+    if not text:
+        return False
+    return any(text.endswith(marker) for marker in END_SENTENCE_MARKERS)
+
+def get_wake_word_position(text: str, wake_word: str) -> str:
+    """
+    Определяет позицию wake word в тексте.
+    Возвращает: 'start', 'middle', 'end', или 'only' (если только wake word)
+    """
+    text_lower = text.lower().strip()
+    words = text_lower.split()
+    
+    if len(words) == 1:
+        return 'only'  # Только wake word
+    
+    # Ищем позицию wake word
+    wake_lower = wake_word.lower()
+    for i, word in enumerate(words):
+        if wake_lower in word:
+            if i == 0:
+                return 'start'
+            elif i == len(words) - 1:
+                return 'end'
+            else:
+                return 'middle'
+    
+    return 'start'  # По умолчанию
 
 # Состояние Smart Turn
 class SmartTurnState:
@@ -74,30 +108,77 @@ class SmartTurnState:
         """Возвращает склеенный текст"""
         return " ".join(self.phrases)
     
-    def should_send(self, has_wake_word: bool, text: str):
+    def should_send(self, has_wake_word: bool, text: str, wake_word: str = None):
         """
         Определяет, нужно ли отправлять в KIKO.
         Возвращает (should_send, full_text)
         """
-        # Если это новая фраза с wake word
-        if has_wake_word:
-            if self.is_active():
-                # Уже был wake word - отправляем накопленное + новое
-                self.add_phrase(text)
-                full_text = self.get_full_text()
-                self.reset()
-                return True, full_text
-            else:
-                # Новый wake word - начинаем накапливать
-                self.reset()
-                self.add_phrase(text)
-                # Ждём ещё - вдруг будет продолжение
-                return False, None
+        # Если это фраза с wake word
+        if has_wake_word and wake_word:
+            position = get_wake_word_position(text, wake_word)
+            
+            # Wake word в середине или конце - отправляем сразу всю фразу
+            if position in ('middle', 'end'):
+                if self.is_active():
+                    # Было что-то накоплено - добавляем и отправляем
+                    self.add_phrase(text)
+                    full_text = self.get_full_text()
+                    self.reset()
+                    return True, full_text
+                else:
+                    # Отправляем только эту фразу
+                    self.reset()
+                    return True, text
+            
+            # Wake word только один (без команды) - ждём продолжения
+            if position == 'only':
+                if self.is_active():
+                    # Уже был wake word - отправляем накопленное
+                    full_text = self.get_full_text()
+                    self.reset()
+                    # Начинаем новый цикл с этим wake word
+                    self.add_phrase(text)
+                    return True, full_text
+                else:
+                    # Ждём команду после wake word
+                    self.reset()
+                    self.add_phrase(text)
+                    return False, None
+            
+            # Wake word в начале
+            if position == 'start':
+                # Проверяем конец предложения
+                if is_sentence_complete(text):
+                    if self.is_active():
+                        self.add_phrase(text)
+                        full_text = self.get_full_text()
+                        self.reset()
+                        return True, full_text
+                    else:
+                        self.reset()
+                        return True, text
+                
+                # Нет конца предложения - ждём продолжения
+                if self.is_active():
+                    self.add_phrase(text)
+                    full_text = self.get_full_text()
+                    self.reset()
+                    return True, full_text
+                else:
+                    self.reset()
+                    self.add_phrase(text)
+                    return False, None
         
         # Фраза без wake word
         if self.is_active():
             # Продолжение после wake word
             self.add_phrase(text)
+            
+            # Если конец предложения - отправляем
+            if is_sentence_complete(text):
+                full_text = self.get_full_text()
+                self.reset()
+                return True, full_text
             
             # Если набрали максимум фраз - отправляем
             if len(self.phrases) >= SMART_TURN_MAX_PHRASES:
@@ -228,22 +309,23 @@ def process_voice_input(voice_input_str: str, kiko_url: str):
     has_wake = found_wake is not None
     
     if has_wake:
-        print(f"[WAKE] Обнаружено wake word '{found_wake}'")
+        position = get_wake_word_position(voice_input_str, found_wake)
+        print(f"[WAKE] '{found_wake}' (позиция: {position})")
     
     # Smart Turn логика
-    should_send, full_text = smart_turn.should_send(has_wake, voice_input_str)
+    should_send, full_text = smart_turn.should_send(has_wake, voice_input_str, found_wake)
     
     if should_send and full_text:
-        print(f"[SMART] Отправка склеенной фразы: '{full_text}'")
+        print(f"[SEND] → '{full_text}'")
         send_to_kiko(full_text, kiko_url)
         return True
     
     if smart_turn.is_active():
-        print(f"[SMART] Ожидание продолжения... ({len(smart_turn.phrases)} фраз)")
+        print(f"[WAIT] Ожидание... ({len(smart_turn.phrases)} фраз)")
         return False
     
     if not has_wake:
-        print(f"[SKIP] Нет wake word в: '{voice_input_str}'")
+        print(f"[SKIP] '{voice_input_str}'")
     
     return False
 
