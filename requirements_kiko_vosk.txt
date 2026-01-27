@@ -1,0 +1,4 @@
+# KIKO Vosk STT - минимальные зависимости
+vosk>=0.3.45
+sounddevice>=0.4.6
+requests>=2.28.0

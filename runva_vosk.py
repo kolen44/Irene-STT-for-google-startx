@@ -11,7 +11,8 @@ import threading
 import requests
 
 # Настройки KIKO
-KIKO_URL = os.environ.get("KIKO_URL", "http://server:3000/ai")
+# KIKO запущен через docker-compose с network_mode: host, PORT: 3001
+KIKO_URL = os.environ.get("KIKO_URL", "http://127.0.0.1:3001/ai")
 SESSION_ID = "vosk-session-1"
 
 # Wake words - разные вариации на русском и английском
@@ -33,8 +34,8 @@ WAKE_WORDS = [
 ]
 
 # Smart Turn - настройки умного склеивания фраз
-SMART_TURN_TIMEOUT = 3.0  # секунд ждать продолжения после wake word
-SMART_TURN_MAX_PHRASES = 3  # максимум фраз для склеивания
+SMART_TURN_TIMEOUT = 5.0  # секунд ждать продолжения после wake word (увеличено для плохого распознавания)
+SMART_TURN_MAX_PHRASES = 5  # максимум фраз для склеивания
 
 import time
 
@@ -57,12 +58,17 @@ class SmartTurnState:
         elapsed = time.time() - self.wake_time
         return elapsed < SMART_TURN_TIMEOUT
     
+    def extend_timeout(self):
+        """Продлевает таймаут - вызывать когда есть активность (partial результаты)"""
+        if self.wake_detected:
+            self.wake_time = time.time()
+    
     def add_phrase(self, text: str):
         """Добавляет фразу в буфер"""
         self.phrases.append(text)
         if not self.wake_detected:
             self.wake_detected = True
-            self.wake_time = time.time()
+        self.wake_time = time.time()  # Всегда обновляем время
     
     def get_full_text(self):
         """Возвращает склеенный текст"""
@@ -125,12 +131,10 @@ rtsp_process = None
 
 def block_mic():
     global mic_blocked
-    print("[DEBUG] Блокировка микрофона")
     mic_blocked = True
 
 def unblock_mic():
     global mic_blocked
-    print("[DEBUG] Разблокировка микрофона")
     mic_blocked = False
 
 def clear_queue(q):
@@ -151,7 +155,7 @@ def send_to_kiko(text: str, kiko_url: str):
     Отправляет текст в KIKO AI через HTTP POST.
     Отправляет полный текст - KIKO сам обработает wake word.
     """
-    print(f"[KIKO] Отправка в KIKO: '{text}'")
+    print(f"[KIKO] → Отправка: '{text}'")
     
     try:
         payload = {
@@ -163,26 +167,41 @@ def send_to_kiko(text: str, kiko_url: str):
         response = requests.post(
             kiko_url,
             json=payload,
-            timeout=30
+            timeout=60,
+            headers={"Content-Type": "application/json"}
         )
         
-        if response.status_code == 200:
-            result = response.json()
-            if "response" in result:
-                print(f"[KIKO] Ответ: {result['response'][:200]}...")
-            elif "error" in result:
-                print(f"[KIKO] Ошибка: {result['error']}")
-            else:
-                print(f"[KIKO] Результат: {result}")
+        if response.status_code == 200 or response.status_code == 201:
+            try:
+                result = response.json()
+                if "response" in result:
+                    answer = result['response']
+                    # Показываем первые 150 символов ответа
+                    preview = answer[:150] + '...' if len(answer) > 150 else answer
+                    print(f"[KIKO] ✓ Ответ: {preview}")
+                    return True
+                elif "error" in result:
+                    if result['error'] == 'busy':
+                        print(f"[KIKO] ⚠ KIKO занят - повторите через пару секунд")
+                    else:
+                        print(f"[KIKO] ✗ Ошибка: {result['error']}")
+                else:
+                    print(f"[KIKO] ✓ OK")
+                    return True
+            except:
+                print(f"[KIKO] ✓ Получен ответ")
+                return True
         else:
-            print(f"[KIKO] HTTP ошибка {response.status_code}: {response.text[:200]}")
+            print(f"[KIKO] ✗ HTTP {response.status_code}")
             
     except requests.exceptions.ConnectionError:
-        print(f"[KIKO] Не удалось подключиться к {KIKO_URL}")
+        print(f"[KIKO] ✗ Нет связи с {kiko_url}")
     except requests.exceptions.Timeout:
-        print("[KIKO] Таймаут запроса")
+        print("[KIKO] ✗ Таймаут (60 сек)")
     except Exception as e:
-        print(f"[KIKO] Ошибка: {e}")
+        print(f"[KIKO] ✗ Ошибка: {e}")
+    
+    return False
 
 
 def check_wake_word(text: str) -> str | None:
@@ -348,8 +367,8 @@ if __name__ == "__main__":
         help='RTSP URL для получения аудио с IP камеры')
     parser.add_argument(
         '--kiko-url', type=str, metavar='KIKO_URL',
-        default=os.environ.get("KIKO_URL", "http://server:3000/ai"),
-        help='URL KIKO AI сервера (по умолчанию http://server:3000/ai)')
+        default=os.environ.get("KIKO_URL", "http://127.0.0.1:3001/ai"),
+        help='URL KIKO AI сервера (по умолчанию http://127.0.0.1:3001/ai)')
     args = parser.parse_args(remaining)
     
     # Используем URL из аргументов
@@ -423,6 +442,11 @@ if __name__ == "__main__":
                             # Очищаем очередь и разблокируем
                             clear_queue(q)
                             unblock_mic()
+                    else:
+                        # Partial результат - человек ещё говорит, продлеваем таймаут
+                        partial = json.loads(rec.PartialResult())
+                        if partial.get("partial", "").strip():
+                            smart_turn.extend_timeout()
                     
                     # Проверяем таймаут Smart Turn
                     check_smart_turn_timeout(kiko_url)
