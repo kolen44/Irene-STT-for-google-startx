@@ -1,207 +1,97 @@
+#!/usr/bin/env python3
+"""
+KIKO Voice Assistant - Vosk STT клиент
+Минимальный клиент для распознавания речи и отправки в KIKO.
+"""
+
 import argparse
+import json
+import logging
 import os
 import queue
-import sounddevice as sd
-import vosk
-import sys
-import logging
-import json
 import subprocess
+import sys
 import threading
-import requests
-
-# Настройки KIKO
-# KIKO запущен через docker-compose с network_mode: host, PORT: 3001
-KIKO_URL = os.environ.get("KIKO_URL", "http://127.0.0.1:3001/ai")
-SESSION_ID = "vosk-session-1"
-
-# Wake words - разные вариации на русском и английском
-WAKE_WORDS = [
-    # Русский
-    "оптимус",
-    "оптимуса", 
-    "оптимусу",
-    "оптимусом",
-    "оптимусе",
-    # Английский
-    "optimus",
-    "optimous",
-    "optimis",
-    # Транслит/ошибки распознавания
-    "оптимас",
-    "оптимос",
-    "оптимес",
-]
-
-# Smart Turn - настройки умного склеивания фраз
-SMART_TURN_TIMEOUT = 3.0  # секунд тишины для отправки накопленного
-
 import time
 
-# Состояние Smart Turn
-class SmartTurnState:
-    def __init__(self):
-        self.wake_detected = False
-        self.wake_time = 0
-        self.phrases = []
-    
-    def reset(self):
-        self.wake_detected = False
-        self.wake_time = 0
-        self.phrases = []
-    
-    def is_active(self):
-        """Проверяет, активен ли режим накопления"""
-        return self.wake_detected
-    
-    def time_since_last_phrase(self):
-        """Возвращает время с последней фразы"""
-        if not self.wake_detected:
-            return float('inf')
-        return time.time() - self.wake_time
-    
-    def extend_timeout(self):
-        """Продлевает таймаут - вызывать когда есть активность (partial результаты)"""
-        if self.wake_detected:
-            self.wake_time = time.time()
-    
-    def add_phrase(self, text: str):
-        """Добавляет фразу в буфер"""
-        self.phrases.append(text)
-        if not self.wake_detected:
-            self.wake_detected = True
-        self.wake_time = time.time()
-    
-    def get_full_text(self):
-        """Возвращает склеенный текст"""
-        return " ".join(self.phrases)
-    
-    def should_send(self, has_wake_word: bool, text: str):
-        """
-        Простая логика:
-        - Если есть wake word и мы не накапливаем → начинаем накапливать
-        - Если есть wake word и уже накапливаем → добавляем и продолжаем
-        - Если нет wake word и накапливаем → добавляем и продолжаем
-        - Отправка ТОЛЬКО по таймауту (в flush_if_timeout)
-        
-        Возвращает (should_send, full_text) - всегда (False, None)
-        """
-        if has_wake_word:
-            # Новая фраза с wake word
-            if self.is_active():
-                # Уже накапливаем - просто добавляем
-                self.add_phrase(text)
-            else:
-                # Начинаем накапливать
-                self.reset()
-                self.add_phrase(text)
-            return False, None
-        
-        # Фраза без wake word
-        if self.is_active():
-            # Продолжение - добавляем
-            self.add_phrase(text)
-        
-        # Никогда не отправляем сразу - только по таймауту
-        return False, None
-    
-    def flush_if_timeout(self):
-        """
-        Проверяет таймаут и возвращает накопленный текст если пора.
-        Единственное место где происходит отправка.
-        """
-        if self.wake_detected and len(self.phrases) > 0:
-            if self.time_since_last_phrase() >= SMART_TURN_TIMEOUT:
-                full_text = self.get_full_text()
-                self.reset()
-                return full_text
-        return None
+import requests
+import vosk
 
-smart_turn = SmartTurnState()
+# Опциональный sounddevice для локального микрофона
+try:
+    import sounddevice as sd
+    HAS_SOUNDDEVICE = True
+except ImportError:
+    HAS_SOUNDDEVICE = False
 
+# === КОНФИГУРАЦИЯ ===
+KIKO_URL = os.environ.get("KIKO_URL", "http://127.0.0.1:3001/ai")
+SESSION_ID = "vosk-session-1"
+SMART_TURN_TIMEOUT = 3.0  # секунд тишины для отправки
+
+# Wake words
+WAKE_WORDS = frozenset([
+    "оптимус", "оптимуса", "оптимусу", "оптимусом", "оптимусе",
+    "optimus", "optimous", "optimis",
+    "оптимас", "оптимос", "оптимес",
+])
+
+# === ГЛОБАЛЬНОЕ СОСТОЯНИЕ ===
 mic_blocked = False
 rtsp_process = None
 
-def block_mic():
-    global mic_blocked
-    mic_blocked = True
 
-def unblock_mic():
-    global mic_blocked
-    mic_blocked = False
-
-def clear_queue(q):
-    """Очищает очередь от накопившихся данных"""
-    cleared = 0
-    while not q.empty():
-        try:
-            q.get_nowait()
-            cleared += 1
-        except:
-            break
-    if cleared > 0:
-        print(f"[DEBUG] Очищено {cleared} буферов из очереди")
-
-
-def send_to_kiko(text: str, kiko_url: str):
-    """
-    Отправляет текст в KIKO AI через HTTP POST.
-    Отправляет полный текст - KIKO сам обработает wake word.
-    """
-    print(f"[KIKO] → Отправка: '{text}'")
+class SmartTurn:
+    """Накопление фраз после wake word, отправка по таймауту."""
     
-    try:
-        payload = {
-            "sessionId": SESSION_ID,
-            "prompt": text,
-            "source": "asr"
-        }
-        
-        response = requests.post(
-            kiko_url,
-            json=payload,
-            timeout=60,
-            headers={"Content-Type": "application/json"}
-        )
-        
-        if response.status_code == 200 or response.status_code == 201:
-            try:
-                result = response.json()
-                if "response" in result:
-                    answer = result['response']
-                    # Показываем первые 150 символов ответа
-                    preview = answer[:150] + '...' if len(answer) > 150 else answer
-                    print(f"[KIKO] ✓ Ответ: {preview}")
-                    return True
-                elif "error" in result:
-                    if result['error'] == 'busy':
-                        print(f"[KIKO] ⚠ KIKO занят - повторите через пару секунд")
-                    else:
-                        print(f"[KIKO] ✗ Ошибка: {result['error']}")
-                else:
-                    print(f"[KIKO] ✓ OK")
-                    return True
-            except:
-                print(f"[KIKO] ✓ Получен ответ")
-                return True
-        else:
-            print(f"[KIKO] ✗ HTTP {response.status_code}")
-            
-    except requests.exceptions.ConnectionError:
-        print(f"[KIKO] ✗ Нет связи с {kiko_url}")
-    except requests.exceptions.Timeout:
-        print("[KIKO] ✗ Таймаут (60 сек)")
-    except Exception as e:
-        print(f"[KIKO] ✗ Ошибка: {e}")
+    __slots__ = ('active', 'last_time', 'phrases')
     
-    return False
+    def __init__(self):
+        self.active = False
+        self.last_time = 0.0
+        self.phrases = []
+    
+    def reset(self):
+        self.active = False
+        self.last_time = 0.0
+        self.phrases.clear()
+    
+    def add(self, text: str):
+        self.phrases.append(text)
+        self.active = True
+        self.last_time = time.time()
+    
+    def extend(self):
+        """Продлить таймаут (при partial результатах)."""
+        if self.active:
+            self.last_time = time.time()
+    
+    def check_timeout(self) -> str | None:
+        """Возвращает накопленный текст если истёк таймаут."""
+        if self.active and self.phrases:
+            if time.time() - self.last_time >= SMART_TURN_TIMEOUT:
+                result = " ".join(self.phrases)
+                self.reset()
+                return result
+        return None
+    
+    def status(self) -> str:
+        if not self.active:
+            return ""
+        remaining = SMART_TURN_TIMEOUT - (time.time() - self.last_time)
+        return f"[{len(self.phrases)} фраз, {remaining:.1f}с]"
 
 
-def check_wake_word(text: str) -> str | None:
-    """
-    Проверяет наличие любого wake word в тексте.
-    Возвращает найденное wake word или None.
-    """
+smart_turn = SmartTurn()
+
+
+def find_wake_word(text: str) -> str | None:
+    """Ищет wake word в тексте."""
+    words = text.lower().split()
+    for word in words:
+        if word in WAKE_WORDS:
+            return word
+    # Проверка на подстроку (если wake word склеился)
     text_lower = text.lower()
     for wake in WAKE_WORDS:
         if wake in text_lower:
@@ -209,286 +99,255 @@ def check_wake_word(text: str) -> str | None:
     return None
 
 
-def process_voice_input(voice_input_str: str, kiko_url: str):
-    """
-    Обрабатывает распознанную речь с Smart Turn.
-    Накапливает фразы после wake word, отправка только по таймауту.
-    """
-    global smart_turn
+def send_to_kiko(text: str, url: str) -> bool:
+    """Отправляет текст в KIKO."""
+    print(f"[KIKO] → {text}")
     
-    # Проверяем наличие wake word
-    found_wake = check_wake_word(voice_input_str)
-    has_wake = found_wake is not None
-    
-    if has_wake:
-        print(f"[WAKE] '{found_wake}' в: '{voice_input_str}'")
-    
-    # Smart Turn логика - только накапливает, не отправляет
-    smart_turn.should_send(has_wake, voice_input_str)
-    
-    if smart_turn.is_active():
-        print(f"[BUFFER] {len(smart_turn.phrases)} фраз, ждём {SMART_TURN_TIMEOUT}с тишины...")
-        return False
-    
-    if not has_wake:
-        print(f"[SKIP] '{voice_input_str}'")
+    try:
+        resp = requests.post(
+            url,
+            json={"sessionId": SESSION_ID, "prompt": text, "source": "asr"},
+            timeout=60,
+            headers={"Content-Type": "application/json"}
+        )
+        
+        if resp.status_code in (200, 201):
+            try:
+                data = resp.json()
+                if "response" in data:
+                    preview = data['response'][:100]
+                    print(f"[KIKO] ✓ {preview}{'...' if len(data['response']) > 100 else ''}")
+                elif data.get("error") == "busy":
+                    print("[KIKO] ⚠ Занят")
+                else:
+                    print("[KIKO] ✓")
+            except:
+                print("[KIKO] ✓")
+            return True
+        else:
+            print(f"[KIKO] ✗ HTTP {resp.status_code}")
+            
+    except requests.exceptions.ConnectionError:
+        print(f"[KIKO] ✗ Нет связи")
+    except requests.exceptions.Timeout:
+        print("[KIKO] ✗ Таймаут")
+    except Exception as e:
+        print(f"[KIKO] ✗ {e}")
     
     return False
 
 
-def check_smart_turn_timeout(kiko_url: str):
-    """Проверяет таймаут Smart Turn и отправляет если нужно"""
-    global smart_turn
+def process_text(text: str, kiko_url: str):
+    """Обрабатывает распознанный текст."""
+    wake = find_wake_word(text)
     
-    full_text = smart_turn.flush_if_timeout()
-    if full_text:
-        print(f"[SMART] Таймаут - отправка: '{full_text}'")
-        send_to_kiko(full_text, kiko_url)
+    if wake:
+        print(f"[WAKE] '{wake}' → накапливаю")
+        smart_turn.add(text)
+    elif smart_turn.active:
+        smart_turn.add(text)
+        print(f"[+] {smart_turn.status()}")
+    else:
+        print(f"[SKIP] {text}")
+
+
+def check_and_send(kiko_url: str) -> bool:
+    """Проверяет таймаут и отправляет если нужно."""
+    text = smart_turn.check_timeout()
+    if text:
+        print(f"[SEND] Таймаут → отправка")
+        send_to_kiko(text, kiko_url)
         return True
     return False
 
 
-def rtsp_audio_stream(rtsp_url: str, sample_rate: int, audio_queue: queue.Queue):
-    """
-    Получает аудио из RTSP потока через ffmpeg и кладёт в очередь.
-    """
+def rtsp_stream(url: str, sample_rate: int, audio_queue: queue.Queue):
+    """Читает аудио из RTSP через ffmpeg."""
     global rtsp_process
-    print(f"[RTSP] Подключение к {rtsp_url.split('@')[-1] if '@' in rtsp_url else rtsp_url}")
+    
+    display_url = url.split('@')[-1] if '@' in url else url
+    print(f"[RTSP] Подключение: {display_url}")
     
     cmd = [
-        'ffmpeg',
-        '-rtsp_transport', 'tcp',
-        '-i', rtsp_url,
-        '-vn',
-        '-acodec', 'pcm_s16le',
-        '-ar', str(sample_rate),
-        '-ac', '1',
-        '-f', 's16le',
-        '-loglevel', 'error',
-        '-'
+        'ffmpeg', '-rtsp_transport', 'tcp', '-i', url,
+        '-vn', '-acodec', 'pcm_s16le', '-ar', str(sample_rate),
+        '-ac', '1', '-f', 's16le', '-loglevel', 'error', '-'
     ]
     
     try:
         rtsp_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=8000 * 2
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=16000
         )
+        print("[RTSP] OK")
         
-        print(f"[RTSP] Подключено, получаю аудио...")
-        
-        block_size = 8000 * 2
+        block_size = 8000 * 2  # 0.5 сек при 16kHz
         
         while True:
-            # ВАЖНО: всегда читаем данные, иначе буфер ffmpeg переполнится!
             data = rtsp_process.stdout.read(block_size)
             if not data:
                 if rtsp_process.poll() is not None:
-                    stderr = rtsp_process.stderr.read().decode()
-                    print(f"[RTSP] Процесс завершился: {stderr}")
+                    print("[RTSP] Отключено")
                     break
                 continue
             
-            # Если микрофон заблокирован - просто выбрасываем данные
-            if mic_blocked:
-                continue
-            
-            try:
-                audio_queue.put(data, timeout=0.5)
-            except queue.Full:
-                # Очередь переполнена, пропускаем буфер
-                pass
-            
+            if not mic_blocked:
+                try:
+                    audio_queue.put_nowait(data)
+                except queue.Full:
+                    pass  # Пропускаем если очередь полная
+                    
     except Exception as e:
         print(f"[RTSP] Ошибка: {e}")
     finally:
         if rtsp_process:
             rtsp_process.kill()
 
-# ------------------- vosk ------------------
-if __name__ == "__main__":
-    # Ограничиваем размер очереди чтобы избежать накопления
-    q = queue.Queue(maxsize=50)
 
-
-
-    def int_or_str(text):
-        """Helper function for argument parsing."""
-        try:
-            return int(text)
-        except ValueError:
-            return text
-
-    def callback(indata, frames, time, status):
-        """This is called (from a separate thread) for each audio block."""
-        if status:
-            print(status, file=sys.stderr)
-        if not mic_blocked:
-            q.put(bytes(indata))
-
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        '-l', '--list-devices', action='store_true',
-        help='show list of audio devices and exit')
-    args, remaining = parser.parse_known_args()
-    if args.list_devices:
-        print(sd.query_devices())
-        parser.exit(0)
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        parents=[parser])
-    parser.add_argument(
-        '-f', '--filename', type=str, metavar='FILENAME',
-        help='audio file to store recording to')
-    parser.add_argument(
-        '-m', '--model', type=str, metavar='MODEL_PATH',
-        help='Path to the model')
-    parser.add_argument(
-        '-d', '--device', type=int_or_str,
-        help='input device (numeric ID or substring)')
-    parser.add_argument(
-        '-r', '--samplerate', type=int, help='sampling rate')
-    parser.add_argument(
-        '--rtsp', type=str, metavar='RTSP_URL',
-        help='RTSP URL для получения аудио с IP камеры')
-    parser.add_argument(
-        '--kiko-url', type=str, metavar='KIKO_URL',
-        default=os.environ.get("KIKO_URL", "http://127.0.0.1:3001/ai"),
-        help='URL KIKO AI сервера (по умолчанию http://127.0.0.1:3001/ai)')
-    args = parser.parse_args(remaining)
+def main():
+    global mic_blocked, rtsp_process
     
-    # Используем URL из аргументов
-    kiko_url = args.kiko_url
-
-    # настраиваем логирование
-    logger = logging.getLogger('runva_vosk')  # задаём конкретное имя, иначе здесь будет  __main__
-
+    parser = argparse.ArgumentParser(description='KIKO Voice Assistant - Vosk STT')
+    parser.add_argument('-m', '--model', default='model', help='Путь к модели Vosk')
+    parser.add_argument('-r', '--samplerate', type=int, help='Sample rate')
+    parser.add_argument('--rtsp', metavar='URL', help='RTSP URL камеры')
+    parser.add_argument('--kiko-url', default=KIKO_URL, help='URL KIKO сервера')
+    parser.add_argument('-d', '--device', help='Аудио устройство (для микрофона)')
+    parser.add_argument('-l', '--list-devices', action='store_true', help='Показать устройства')
+    args = parser.parse_args()
+    
+    if args.list_devices:
+        if HAS_SOUNDDEVICE:
+            print(sd.query_devices())
+        else:
+            print("sounddevice не установлен")
+        return
+    
+    # Проверка модели
+    if not os.path.exists(args.model):
+        print(f"Модель не найдена: {args.model}")
+        print("Скачайте с https://alphacephei.com/vosk/models")
+        return 1
+    
+    use_rtsp = args.rtsp is not None
+    
+    if not use_rtsp and not HAS_SOUNDDEVICE:
+        print("Для режима микрофона нужен sounddevice: pip install sounddevice")
+        return 1
+    
+    # Sample rate
+    if args.samplerate:
+        sample_rate = args.samplerate
+    elif use_rtsp:
+        sample_rate = 16000
+    else:
+        device_info = sd.query_devices(args.device, 'input')
+        sample_rate = int(device_info['default_samplerate'])
+    
+    # Загрузка модели
+    print(f"[VOSK] Загрузка модели: {args.model}")
+    model = vosk.Model(args.model)
+    rec = vosk.KaldiRecognizer(model, sample_rate)
+    print("[VOSK] OK")
+    
+    # Инфо
+    print("=" * 60)
+    print(f"KIKO: {args.kiko_url}")
+    print(f"Wake: {', '.join(list(WAKE_WORDS)[:3])}...")
+    print(f"Таймаут: {SMART_TURN_TIMEOUT}с")
+    if use_rtsp:
+        display = args.rtsp.split('@')[-1] if '@' in args.rtsp else args.rtsp
+        print(f"RTSP: {display}")
+    print(f"Rate: {sample_rate}")
+    print("Ctrl+C для выхода")
+    print("=" * 60)
+    
+    audio_q = queue.Queue(maxsize=50)
+    
     try:
-        if args.model is None:
-            args.model = "model"
-        if not os.path.exists(args.model):
-            print ("Please download a model for your language from https://alphacephei.com/vosk/models")
-            print ("and unpack as 'model' in the current folder.")
-            parser.exit(0)
-        
-        # Определяем режим: RTSP или локальный микрофон
-        use_rtsp = args.rtsp is not None
-        
         if use_rtsp:
-            # Для RTSP используем 16000 по умолчанию
-            if args.samplerate is None:
-                args.samplerate = 16000
-        else:
-            if args.samplerate is None:
-                device_info = sd.query_devices(args.device, 'input')
-                args.samplerate = int(device_info['default_samplerate'])
-
-        model = vosk.Model(args.model)
-
-        if args.filename:
-            dump_fn = open(args.filename, "wb")
-        else:
-            dump_fn = None
-
-        rec = vosk.KaldiRecognizer(model, args.samplerate)
-
-        print('#' * 80)
-        print('KIKO Voice Assistant via Irene STT')
-        print(f'Wake words: {", ".join(WAKE_WORDS[:5])}...')
-        print(f'Smart Turn: {SMART_TURN_TIMEOUT}s тишины для отправки')
-        print(f'KIKO URL: {kiko_url}')
-        if use_rtsp:
-            print(f'RTSP режим: {args.rtsp.split("@")[-1] if "@" in args.rtsp else args.rtsp}')
-        print(f'Sample rate: {args.samplerate}')
-        print('Press Ctrl+C to stop the recording')
-        print('#' * 80)
-
-        # === РЕЖИМ RTSP ===
-        if use_rtsp:
-            rtsp_thread = threading.Thread(
-                target=rtsp_audio_stream,
-                args=(args.rtsp, args.samplerate, q),
+            # RTSP режим
+            thread = threading.Thread(
+                target=rtsp_stream,
+                args=(args.rtsp, sample_rate, audio_q),
                 daemon=True
             )
-            rtsp_thread.start()
+            thread.start()
             
             while True:
                 try:
-                    data = q.get(timeout=1.0)  # Короткий таймаут для проверки Smart Turn
-                    
-                    if rec.AcceptWaveform(data):
-                        recognized_data = json.loads(rec.Result())
-                        voice_input_str = recognized_data["text"]
-                        
-                        if voice_input_str != "":
-                            print(f"[РАСПОЗНАНО] {voice_input_str}")
-                            # Обработка через KIKO (если есть wake word)
-                            block_mic()
-                            process_voice_input(voice_input_str, kiko_url)
-                            # Очищаем очередь и разблокируем
-                            clear_queue(q)
-                            unblock_mic()
-                    else:
-                        # Partial результат - человек ещё говорит, продлеваем таймаут
-                        partial = json.loads(rec.PartialResult())
-                        if partial.get("partial", "").strip():
-                            smart_turn.extend_timeout()
-                    
-                    # Проверяем таймаут Smart Turn
-                    check_smart_turn_timeout(kiko_url)
-                    
-                    if dump_fn is not None:
-                        dump_fn.write(data)
-                        
+                    data = audio_q.get(timeout=0.5)
                 except queue.Empty:
-                    # Проверяем таймаут Smart Turn даже если нет данных
-                    check_smart_turn_timeout(kiko_url)
+                    check_and_send(args.kiko_url)
                     continue
-                except Exception as e:
-                    print(f"[ERROR] Ошибка в главном цикле: {e}")
-                    unblock_mic()
-                    continue
+                
+                if rec.AcceptWaveform(data):
+                    result = json.loads(rec.Result())
+                    text = result.get("text", "").strip()
+                    if text:
+                        print(f"[→] {text}")
+                        mic_blocked = True
+                        process_text(text, args.kiko_url)
+                        # Очистка очереди
+                        while not audio_q.empty():
+                            try:
+                                audio_q.get_nowait()
+                            except:
+                                break
+                        mic_blocked = False
+                else:
+                    partial = json.loads(rec.PartialResult())
+                    if partial.get("partial", "").strip():
+                        smart_turn.extend()
+                
+                check_and_send(args.kiko_url)
         
-        # === РЕЖИМ ЛОКАЛЬНОГО МИКРОФОНА ===
         else:
-            with sd.RawInputStream(samplerate=args.samplerate, blocksize=8000, device=args.device, dtype='int16',
-                                   channels=1, callback=callback):
-
+            # Микрофон
+            def callback(indata, frames, time_info, status):
+                if status:
+                    print(status, file=sys.stderr)
+                if not mic_blocked:
+                    audio_q.put(bytes(indata))
+            
+            with sd.RawInputStream(
+                samplerate=sample_rate, blocksize=8000,
+                device=args.device, dtype='int16', channels=1,
+                callback=callback
+            ):
                 while True:
                     try:
-                        data = q.get(timeout=1.0)  # Короткий таймаут для Smart Turn
+                        data = audio_q.get(timeout=0.5)
                     except queue.Empty:
-                        # Проверяем таймаут Smart Turn
-                        check_smart_turn_timeout(kiko_url)
+                        check_and_send(args.kiko_url)
                         continue
                     
                     if rec.AcceptWaveform(data):
-                        recognized_data = rec.Result()
-                        recognized_data = json.loads(recognized_data)
-                        voice_input_str = recognized_data["text"]
-
-                        if voice_input_str != "":
-                            print(f"[РАСПОЗНАНО] {voice_input_str}")
-                            # Обработка через KIKO (если есть wake word)
-                            block_mic()
-                            process_voice_input(voice_input_str, kiko_url)
-                            unblock_mic()
+                        result = json.loads(rec.Result())
+                        text = result.get("text", "").strip()
+                        if text:
+                            print(f"[→] {text}")
+                            mic_blocked = True
+                            process_text(text, args.kiko_url)
+                            mic_blocked = False
+                    else:
+                        partial = json.loads(rec.PartialResult())
+                        if partial.get("partial", "").strip():
+                            smart_turn.extend()
                     
-                    # Проверяем таймаут Smart Turn
-                    check_smart_turn_timeout(kiko_url)
-
-                    if dump_fn is not None:
-                        dump_fn.write(data)
-
+                    check_and_send(args.kiko_url)
+    
     except KeyboardInterrupt:
-        print('\nDone')
+        print("\nВыход")
+    finally:
         if rtsp_process:
             rtsp_process.kill()
-        parser.exit(0)
-    except Exception as e:
-        logger.exception(e)
-        parser.exit(type(e).__name__ + ': ' + str(e))
+    
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING)
+    sys.exit(main() or 0)
 
 
