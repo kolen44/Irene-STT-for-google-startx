@@ -16,6 +16,7 @@ import time
 
 import requests
 import vosk
+import difflib
 
 # Опциональный sounddevice для локального микрофона
 try:
@@ -27,7 +28,13 @@ except ImportError:
 # === КОНФИГУРАЦИЯ ===
 KIKO_URL = os.environ.get("KIKO_URL", "http://127.0.0.1:3001/ai")
 SESSION_ID = "vosk-session-1"
-SMART_TURN_TIMEOUT = 3.0  # секунд тишины для отправки
+SMART_TURN_TIMEOUT = 0.8  # секунд тишины для отправки
+
+# Параметры аудио буферов
+FRAME_DURATION_MS = 30
+SAMPLE_RATE = 16000
+FRAME_SIZE = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) # 480 samples
+FRAME_BYTES = FRAME_SIZE * 2 # 960 bytes (16-bit audio)
 
 # Wake words
 WAKE_WORDS = frozenset([
@@ -37,7 +44,6 @@ WAKE_WORDS = frozenset([
 ])
 
 # === ГЛОБАЛЬНОЕ СОСТОЯНИЕ ===
-mic_blocked = False
 rtsp_process = None
 
 
@@ -69,11 +75,22 @@ class SmartTurn:
     def check_timeout(self) -> str | None:
         """Возвращает накопленный текст если истёк таймаут."""
         if self.active and self.phrases:
-            if time.time() - self.last_time >= SMART_TURN_TIMEOUT:
+            elapsed = time.time() - self.last_time
+            
+            # АДАПТИВНЫЙ ТАЙМАУТ: короткие команды = короткий таймаут
+            if len(self.phrases) == 1:
+                timeout = 0.6  # Одна фраза - быстрый ответ
+            elif len(self.phrases) <= 3:
+                timeout = 0.8  # Обычная команда
+            else:
+                timeout = 1.2  # Длинное высказывание - больше пауз
+        
+            if elapsed >= timeout:
                 result = " ".join(self.phrases)
                 self.reset()
                 return result
         return None
+
     
     def status(self) -> str:
         if not self.active:
@@ -85,18 +102,45 @@ class SmartTurn:
 smart_turn = SmartTurn()
 
 
-def find_wake_word(text: str) -> str | None:
-    """Ищет wake word в тексте."""
+def find_wake_word(text: str, threshold: float = 0.75) -> tuple[str | None, float]:
+    """
+    Нечёткий поиск wake word с использованием fuzzy matching.
+    
+    Возвращает (wake_word, уверенность) или (None, 0.0)
+    
+    Распознаёт варианты типа:
+    - "оптимас" когда ожидается "оптимус"
+    - "optimis" когда ожидается "optimus"
+    """
+    if not text:
+        return None, 0.0
+    
     words = text.lower().split()
+    best_match = None
+    best_score = 0.0
+    
     for word in words:
-        if word in WAKE_WORDS:
-            return word
-    # Проверка на подстроку (если wake word склеился)
-    text_lower = text.lower()
-    for wake in WAKE_WORDS:
-        if wake in text_lower:
-            return wake
-    return None
+        for wake in WAKE_WORDS:
+            # Точное совпадение — мгновенный возврат
+            if word == wake:
+                return wake, 1.0
+            
+            # Нечёткое сравнение с использованием SequenceMatcher
+            score = difflib.SequenceMatcher(None, word, wake).ratio()
+            
+            if score > best_score and score >= threshold:
+                best_score = score
+                best_match = wake
+    
+    # Проверка подстроки ТОЛЬКО если нечёткое совпадение не найдено
+    # (предотвращает перезапись точного совпадения 0.99 подстрокой 0.95)
+    if best_match is None:
+        text_lower = text.lower()
+        for wake in WAKE_WORDS:
+            if wake in text_lower:
+                return wake, 0.95
+    
+    return best_match, best_score
 
 
 def send_to_kiko(text: str, url: str) -> bool:
@@ -139,7 +183,7 @@ def send_to_kiko(text: str, url: str) -> bool:
 
 def process_text(text: str, kiko_url: str):
     """Обрабатывает распознанный текст."""
-    wake = find_wake_word(text)
+    wake, confidence = find_wake_word(text)
     
     if wake:
         print(f"[WAKE] '{wake}' → накапливаю")
@@ -181,7 +225,7 @@ def rtsp_stream(url: str, sample_rate: int, audio_queue: queue.Queue):
         )
         print("[RTSP] OK")
         
-        block_size = 8000 * 2  # 0.5 сек при 16kHz
+        block_size = FRAME_BYTES
         
         while True:
             data = rtsp_process.stdout.read(block_size)
@@ -191,11 +235,10 @@ def rtsp_stream(url: str, sample_rate: int, audio_queue: queue.Queue):
                     break
                 continue
             
-            if not mic_blocked:
-                try:
-                    audio_queue.put_nowait(data)
-                except queue.Full:
-                    pass  # Пропускаем если очередь полная
+            try:
+                audio_queue.put_nowait(data)
+            except queue.Full:
+                pass  # Пропускаем если очередь полная
                     
     except Exception as e:
         print(f"[RTSP] Ошибка: {e}")
@@ -205,7 +248,7 @@ def rtsp_stream(url: str, sample_rate: int, audio_queue: queue.Queue):
 
 
 def main():
-    global mic_blocked, rtsp_process
+    global rtsp_process
     
     parser = argparse.ArgumentParser(description='KIKO Voice Assistant - Vosk STT')
     parser.add_argument('-m', '--model', default='model', help='Путь к модели Vosk')
@@ -262,7 +305,7 @@ def main():
     print("Ctrl+C для выхода")
     print("=" * 60)
     
-    audio_q = queue.Queue(maxsize=50)
+    audio_q = queue.Queue(maxsize=150)
     
     try:
         if use_rtsp:
@@ -286,32 +329,34 @@ def main():
                     text = result.get("text", "").strip()
                     if text:
                         print(f"[→] {text}")
-                        mic_blocked = True
                         process_text(text, args.kiko_url)
-                        # Очистка очереди
-                        while not audio_q.empty():
-                            try:
-                                audio_q.get_nowait()
-                            except:
-                                break
-                        mic_blocked = False
                 else:
                     partial = json.loads(rec.PartialResult())
-                    if partial.get("partial", "").strip():
-                        smart_turn.extend()
+                    partial_text = partial.get("partial", "").strip()
+                    
+                    if partial_text:
+                        # ПРОВЕРКА WAKE WORD В ЧАСТИЧНЫХ РЕЗУЛЬТАТАХ - ключевое улучшение!
+                        if not smart_turn.active:
+                            wake, confidence = find_wake_word(partial_text)
+                            if wake:
+                                print(f"[WAKE] '{wake}' in partial (уверенность: {confidence:.2f}) → активирую")
+                                smart_turn.active = True
+                                smart_turn.last_time = time.time()
+                        else:
+                            smart_turn.extend()
                 
                 check_and_send(args.kiko_url)
+
         
         else:
             # Микрофон
             def callback(indata, frames, time_info, status):
                 if status:
                     print(status, file=sys.stderr)
-                if not mic_blocked:
-                    audio_q.put(bytes(indata))
+                audio_q.put(bytes(indata))
             
             with sd.RawInputStream(
-                samplerate=sample_rate, blocksize=8000,
+                samplerate=sample_rate, blocksize=FRAME_SIZE,
                 device=args.device, dtype='int16', channels=1,
                 callback=callback
             ):
@@ -327,15 +372,24 @@ def main():
                         text = result.get("text", "").strip()
                         if text:
                             print(f"[→] {text}")
-                            mic_blocked = True
                             process_text(text, args.kiko_url)
-                            mic_blocked = False
                     else:
                         partial = json.loads(rec.PartialResult())
-                        if partial.get("partial", "").strip():
-                            smart_turn.extend()
+                        partial_text = partial.get("partial", "").strip()
+                        
+                        if partial_text:
+                            # ПРОВЕРКА WAKE WORD В ЧАСТИЧНЫХ РЕЗУЛЬТАТАХ
+                            if not smart_turn.active:
+                                wake, confidence = find_wake_word(partial_text)
+                                if wake:
+                                    print(f"[WAKE] '{wake}' in partial (уверенность: {confidence:.2f}) → активирую")
+                                    smart_turn.active = True
+                                    smart_turn.last_time = time.time()
+                            else:
+                                smart_turn.extend()
                     
                     check_and_send(args.kiko_url)
+
     
     except KeyboardInterrupt:
         print("\nВыход")
