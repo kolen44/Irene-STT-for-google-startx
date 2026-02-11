@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+numpy
+onnxruntime-gpu
+transformers
+huggingface-hub>=0.20.0
