@@ -13,11 +13,9 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      # Параметры согласно официальной документации Pipecat
-      # https://docs.pipecat.ai/server/utilities/smart-turn/smart-turn-overview
-      - SMARTTURN_BASE_SILENCE_MS=3000  # stop_secs = 3.0
-      - SMARTTURN_MAX_SILENCE_MS=5000   # fallback
-      - SMARTTURN_P_CONTINUE=0.4
+      - SMARTTURN_BASE_SILENCE_MS=800
+      - SMARTTURN_MAX_SILENCE_MS=4000
+      - SMARTTURN_P_CONTINUE=0.5
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health').read()"]

@@ -41,11 +41,11 @@ SMARTTURN_ENABLED = os.environ.get("SMARTTURN_ENABLED", "1") == "1"
 # https://docs.pipecat.ai/server/utilities/smart-turn/smart-turn-overview
 SMARTTURN_TIMEOUT_MS = int(os.environ.get("SMARTTURN_TIMEOUT_MS", "500"))
 SMARTTURN_TAIL_MS = int(os.environ.get("SMARTTURN_TAIL_MS", "8000"))  # max_duration_secs = 8.0
-SMARTTURN_BASE_SILENCE_MS = int(os.environ.get("SMARTTURN_BASE_SILENCE_MS", "3000"))  # stop_secs = 3.0
-SMARTTURN_RECHECK_MS = int(os.environ.get("SMARTTURN_RECHECK_MS", "1000"))
-SMARTTURN_MAX_SILENCE_MS = int(os.environ.get("SMARTTURN_MAX_SILENCE_MS", "8000"))  # ✅ Increased: hard safety net
-SMARTTURN_P_CONTINUE = float(os.environ.get("SMARTTURN_P_CONTINUE", "0.4"))
-SMARTTURN_CONFIDENCE_DECAY = float(os.environ.get("SMARTTURN_CONFIDENCE_DECAY", "0.05"))  # ✅ Threshold increase per recheck
+SMARTTURN_BASE_SILENCE_MS = int(os.environ.get("SMARTTURN_BASE_SILENCE_MS", "800"))   # первый запрос к SmartTurn
+SMARTTURN_RECHECK_MS = int(os.environ.get("SMARTTURN_RECHECK_MS", "500"))             # интервал перепроверки
+SMARTTURN_MAX_SILENCE_MS = int(os.environ.get("SMARTTURN_MAX_SILENCE_MS", "4000"))    # hard safety net
+SMARTTURN_P_CONTINUE = float(os.environ.get("SMARTTURN_P_CONTINUE", "0.5"))           # порог модели
+SMARTTURN_CONFIDENCE_DECAY = float(os.environ.get("SMARTTURN_CONFIDENCE_DECAY", "0.03"))  # рост порога за recheck
 FALLBACK_TIMEOUT = 0.8
 
 # Параметры аудио буферов
@@ -61,6 +61,13 @@ WAKE_WORDS = frozenset([
     # Или замените на другое wake word, например:
     # "jarvis", "hey jarvis",
     # "computer", "hey computer",
+])
+
+# Шумовые слова — Vosk часто распознаёт фоновый шум камеры как эти слова.
+# Не считаются речью: не сбрасывают таймер тишины SmartTurn.
+NOISE_WORDS = frozenset([
+    "the", "a", "an", "uh", "um", "huh", "ah", "oh", "hmm",
+    "yeah", "yep", "hm", "er", "ugh",
 ])
 
 # === ГЛОБАЛЬНОЕ СОСТОЯНИЕ ===
@@ -387,7 +394,10 @@ def process_text(text: str, kiko_url: str, smart_turn):
         print(f"[WAKE] '{wake}' → накапливаю")
         smart_turn.activate(text)
     elif smart_turn.active:
-        # Продолжение после wake word
+        # Фильтр шумовых слов — не сбрасывают таймер тишины
+        if text.strip().lower() in NOISE_WORDS:
+            print(f"[NOISE] {text}")
+            return
         smart_turn.add_phrase(text)
         print(f"[+] {smart_turn.status()}")
     else:

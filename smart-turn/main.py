@@ -8,11 +8,9 @@ from inference import predict_endpoint
 
 app = FastAPI(title="SmartTurn API (ONNX)")
 
-# Параметры согласно официальной документации Pipecat
-# https://docs.pipecat.ai/server/utilities/smart-turn/smart-turn-overview
-BASE_SILENCE_MS = int(os.getenv("SMARTTURN_BASE_SILENCE_MS", "3000"))  # stop_secs = 3.0
-MAX_SILENCE_MS  = int(os.getenv("SMARTTURN_MAX_SILENCE_MS", "5000"))   # fallback
-P_CONTINUE_TH   = float(os.getenv("SMARTTURN_P_CONTINUE", "0.4"))
+BASE_SILENCE_MS = int(os.getenv("SMARTTURN_BASE_SILENCE_MS", "800"))
+MAX_SILENCE_MS  = int(os.getenv("SMARTTURN_MAX_SILENCE_MS", "4000"))
+P_CONTINUE_TH   = float(os.getenv("SMARTTURN_P_CONTINUE", "0.5"))
 
 class SmartTurnRequest(BaseModel):
     audio_b64: str
