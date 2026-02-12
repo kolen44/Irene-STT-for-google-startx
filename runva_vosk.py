@@ -13,6 +13,8 @@ import subprocess
 import sys
 import threading
 import time
+import wave
+from datetime import datetime
 from typing import Optional, Tuple
 import requests
 import vosk
@@ -102,6 +104,78 @@ class AudioBuffer:
             arr = np.pad(arr, (padding, 0), mode='constant')
         
         return arr.tobytes()
+
+
+class AudioDebugSaver:
+    """Сохраняет аудио, поступающее в Vosk, в WAV файлы для отладки.
+
+    Каждые ``chunk_seconds`` секунд создаётся новый файл вида:
+        audio_debug/2025-01-15_14-30-00_rtsp-192.168.1.100.wav
+        audio_debug/2025-01-15_14-30-00_Built-in-Microphone.wav
+    """
+
+    def __init__(self, source_name: str, sample_rate: int = SAMPLE_RATE,
+                 output_dir: str = "audio_debug", chunk_seconds: int = 30):
+        self.source_name = self._sanitize(source_name)
+        self.sample_rate = sample_rate
+        self.output_dir = output_dir
+        self.chunk_seconds = chunk_seconds
+        self.max_frames = sample_rate * chunk_seconds
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        self._wf: Optional[wave.Wave_write] = None
+        self._frames_written = 0
+        self._lock = threading.Lock()
+
+        self._open_new_file()
+        print(f"[AudioDebug] Сохранение аудио в {output_dir}/ (чанки по {chunk_seconds}с, источник: {self.source_name})")
+
+    @staticmethod
+    def _sanitize(name: str) -> str:
+        """Убирает из имени недопустимые символы для файловой системы."""
+        for ch in [':/\\?*"<>|@']:
+            name = name.replace(ch, '-')
+        # Убираем пароль/логин из RTSP URL
+        if 'rtsp' in name.lower():
+            # Оставляем только хост+порт+путь
+            parts = name.split('-', 1)
+            if len(parts) > 1:
+                name = parts[-1]
+        return name.strip('-').strip()
+
+    def _open_new_file(self):
+        """Создаёт новый WAV файл."""
+        if self._wf:
+            self._wf.close()
+
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"{ts}_{self.source_name}.wav"
+        filepath = os.path.join(self.output_dir, filename)
+
+        self._wf = wave.open(filepath, 'wb')
+        self._wf.setnchannels(1)
+        self._wf.setsampwidth(2)  # 16-bit
+        self._wf.setframerate(self.sample_rate)
+        self._frames_written = 0
+        print(f"[AudioDebug] Новый файл: {filepath}")
+
+    def write(self, pcm_data: bytes):
+        """Записывает PCM данные. Ротация файла по достижении chunk_seconds."""
+        with self._lock:
+            n_samples = len(pcm_data) // 2
+            self._wf.writeframes(pcm_data)
+            self._frames_written += n_samples
+
+            if self._frames_written >= self.max_frames:
+                self._open_new_file()
+
+    def close(self):
+        """Закрывает текущий файл."""
+        with self._lock:
+            if self._wf:
+                self._wf.close()
+                self._wf = None
 
 
 class SmartTurnClient:
@@ -476,6 +550,9 @@ def main():
     parser.add_argument('-l', '--list-devices', action='store_true', help='Показать устройства')
     parser.add_argument('--smartturn-url', default=SMARTTURN_URL, help='URL SmartTurn сервиса')
     parser.add_argument('--no-smartturn', action='store_true', help='Отключить SmartTurn')
+    parser.add_argument('--save-audio', action='store_true', help='Сохранять аудио в audio_debug/ для отладки')
+    parser.add_argument('--save-audio-dir', default='audio_debug', help='Папка для сохранения аудио (по умолчанию: audio_debug)')
+    parser.add_argument('--save-audio-chunk', type=int, default=30, help='Длина одного WAV файла в секундах (по умолчанию: 30)')
     args = parser.parse_args()
     
     if args.list_devices:
@@ -512,6 +589,31 @@ def main():
     print("[VOSK] OK")
 
     audio_buffer = AudioBuffer(duration_ms=SMARTTURN_TAIL_MS, sample_rate=sample_rate)
+
+    # Debug audio saver
+    audio_saver = None
+    if args.save_audio:
+        if use_rtsp:
+            # Используем хост из RTSP URL как имя источника
+            display = args.rtsp.split('@')[-1] if '@' in args.rtsp else args.rtsp
+            source_name = f"rtsp-{display.replace('rtsp://', '')}"
+        else:
+            # Имя локального микрофона
+            if HAS_SOUNDDEVICE:
+                try:
+                    dev_info = sd.query_devices(args.device, 'input')
+                    source_name = dev_info['name']
+                except Exception:
+                    source_name = f"mic-{args.device}" if args.device else "default-mic"
+            else:
+                source_name = "unknown-mic"
+        audio_saver = AudioDebugSaver(
+            source_name=source_name,
+            sample_rate=sample_rate,
+            output_dir=args.save_audio_dir,
+            chunk_seconds=args.save_audio_chunk,
+        )
+
     smartturn_enabled = SMARTTURN_ENABLED and not args.no_smartturn
     smartturn_client = SmartTurnClient(
         args.smartturn_url, 
@@ -557,10 +659,12 @@ def main():
                 try:
                     data = audio_q.get(timeout=0.5)
                     audio_buffer.add(data)
+                    if audio_saver:
+                        audio_saver.write(data)
                 except queue.Empty:
                     check_and_send(args.kiko_url, smart_turn)
                     continue
-                
+
                 if rec.AcceptWaveform(data):
                     result = json.loads(rec.Result())
                     text = result.get("text", "").strip()
@@ -570,7 +674,7 @@ def main():
                 else:
                     partial = json.loads(rec.PartialResult())
                     partial_text = partial.get("partial", "").strip()
-                    
+
                     if partial_text:
                         if not smart_turn.active:
                             wake, confidence = find_wake_word(partial_text)
@@ -579,17 +683,17 @@ def main():
                                 smart_turn.set_active()
                         else:
                             smart_turn.on_partial()
-                
+
                 check_and_send(args.kiko_url, smart_turn)
 
-        
+
         else:
             # Микрофон
             def callback(indata, frames, time_info, status):
                 if status:
                     print(status, file=sys.stderr)
                 audio_q.put(bytes(indata))
-            
+
             with sd.RawInputStream(
                 samplerate=sample_rate, blocksize=FRAME_SIZE,
                 device=args.device, dtype='int16', channels=1,
@@ -599,10 +703,12 @@ def main():
                     try:
                         data = audio_q.get(timeout=0.5)
                         audio_buffer.add(data)
+                        if audio_saver:
+                            audio_saver.write(data)
                     except queue.Empty:
                         check_and_send(args.kiko_url, smart_turn)
                         continue
-                    
+
                     if rec.AcceptWaveform(data):
                         result = json.loads(rec.Result())
                         text = result.get("text", "").strip()
@@ -611,7 +717,7 @@ def main():
                     else:
                         partial = json.loads(rec.PartialResult())
                         partial_text = partial.get("partial", "").strip()
-                        
+
                         if partial_text:
                             if not smart_turn.active:
                                 wake, confidence = find_wake_word(partial_text)
@@ -620,13 +726,15 @@ def main():
                                     smart_turn.set_active()
                             else:
                                 smart_turn.on_partial()
-                    
+
                     check_and_send(args.kiko_url, smart_turn)
 
     
     except KeyboardInterrupt:
         print("\nВыход")
     finally:
+        if audio_saver:
+            audio_saver.close()
         if rtsp_process:
             rtsp_process.kill()
     
