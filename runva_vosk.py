@@ -134,14 +134,11 @@ class AudioDebugSaver:
     @staticmethod
     def _sanitize(name: str) -> str:
         """Убирает из имени недопустимые символы для файловой системы."""
-        for ch in [':/\\?*"<>|@']:
+        for ch in ':/\\?*"<>|@':
             name = name.replace(ch, '-')
-        # Убираем пароль/логин из RTSP URL
-        if 'rtsp' in name.lower():
-            # Оставляем только хост+порт+путь
-            parts = name.split('-', 1)
-            if len(parts) > 1:
-                name = parts[-1]
+        # Сжимаем множественные дефисы
+        while '--' in name:
+            name = name.replace('--', '-')
         return name.strip('-').strip()
 
     def _open_new_file(self):
